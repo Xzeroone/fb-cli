@@ -1,172 +1,115 @@
 # fb — Facebook / Messenger CLI
 
-CLI for **public Facebook posts** and **Messenger**, built on [opencli](https://github.com/jackwener/opencli) + your normal Chrome session.
-
-Not an official Meta product. Uses the WhatsApp-adjacent idea of a local CLI (`wacli`-style UX), but **Facebook has no personal multi-device protocol** — so the backend is:
+Connect Chrome **once**. Everything after that is magic.
 
 ```text
-fb  →  opencli  →  Chrome (your profile + OpenCLI extension)
+fb  →  opencli  →  your Chrome (cookies + OpenCLI extension)
 ```
 
-Windows stay in **background** by default (invisible automation). Chrome must be running and logged into Facebook.
+Not affiliated with Meta. Public / visible content only.
 
 ---
 
-## Is the auth flow easy enough for everyone?
+## One-liner install
 
-**Yes for most desktop users**, if they already use Chrome. It’s multi-step, but each step is normal software setup — not reverse-engineering.
+When this repo is on GitHub:
 
-| Step | What they do | Difficulty |
-|------|----------------|------------|
-| 1 | Install Node 20+ | Easy |
-| 2 | `npm i -g @jackwener/opencli` + this repo’s `install.sh` | Easy |
-| 3 | Install **OpenCLI** from Chrome Web Store | Easy (one click) |
-| 4 | Log into **facebook.com** in Chrome (their own account) | Easy (they already know how) |
-| 5 | `opencli doctor` then `fb whoami` | Easy |
-| 6 | (Optional) `fb-service install` for reboot | Medium (Linux systemd) |
+```bash
+curl -fsSL https://raw.githubusercontent.com/<OWNER>/fb-cli/main/scripts/get-fb.sh | bash
+```
 
-**Not easy / not for:**
+Local / agent:
 
-- Headless servers with no browser  
-- People who refuse browser extensions  
-- Pure “scan a QR and forget Chrome” like WhatsApp `wacli`  
+```bash
+FB_LOCAL_ROOT=/path/to/fb-cli bash /path/to/fb-cli/scripts/get-fb.sh
+```
 
-**Honest UX:** first-time setup is ~10 minutes. After that, if Chrome stays logged in, `fb …` just works — no re-auth every command.
+That installs packages, then runs **`fb setup`** automatically.
+
+---
+
+## `fb setup` — what you click, what we automate
+
+| You do (once) | We automate |
+|---------------|-------------|
+| Click **Add to Chrome** on the store tab | Open the OpenCLI extension page |
+| Log into Facebook if asked | Open login, poll until session works |
+| — | Install adapters, bins, optional systemd |
+| — | Hide Chrome windows; default invisible mode |
+
+Chrome **cannot** silently install Web Store extensions (browser security). One click is the only human step for the extension.
+
+```bash
+fb setup          # re-run anytime if disconnected
+```
+
+---
+
+## Point your agent at it
+
+See **[AGENTS.md](./AGENTS.md)**.
+
+Agent summary:
+
+1. Run the one-liner / `get-fb.sh`  
+2. Tell the human: *“Click Add to Chrome, then finish Facebook login if a tab appears.”*  
+3. Wait for `fb setup` to exit 0  
+4. Use `fb … --json`  
+
+---
+
+## After setup
+
+```bash
+fb whoami
+fb chats --limit 20
+fb thread <id>
+fb pull <thread_or_post_url>
+fb posts "query" --limit 10
+fb post "<url>"
+fb research "topic" --limit 3
+```
+
+Invisible backend by default (`--window background`).
 
 ---
 
 ## Requirements
 
-- **OS:** Linux recommended (systemd units included). macOS/Windows: CLI works; services are Linux-oriented.  
-- **Node.js ≥ 20**  
-- **Google Chrome** (or Chromium with the extension)  
-- **OpenCLI** extension + CLI  
-- Active **Facebook login** in that Chrome profile  
+- Node.js ≥ 20  
+- Google Chrome  
+- Linux recommended for systemd extras  
 
 ---
 
-## Install
+## Optional always-on (Linux)
 
 ```bash
-git clone https://github.com/YOUR_USER/fb-cli.git
-cd fb-cli
-./scripts/install.sh
-```
-
-Ensure `~/bin` (or your install bin dir) is on `PATH`.
-
-### Auth (do once)
-
-1. Install the extension:  
-   [OpenCLI on Chrome Web Store](https://chromewebstore.google.com/detail/opencli/ildkmabpimmkaediidaifkhjpohdnifk)  
-2. Open Chrome → log into [facebook.com](https://www.facebook.com)  
-3. Verify:
-
-```bash
-opencli doctor    # daemon + extension connected
-fb whoami         # logged_in: true
-```
-
-If not logged in:
-
-```bash
-fb auth           # opens a visible Facebook login once
-```
-
-### Optional: always-on (Linux)
-
-```bash
-fb-service install              # opencli daemon + hide timer (~70MB)
-systemctl --user enable --now fb-chrome-lean.service   # attach/start your real Chrome profile
-# optional after reboot without desktop session:
-loginctl enable-linger $USER
-```
-
-Lean Chrome uses **your Default profile** (cookies + extension) — no second empty profile.
-
----
-
-## Quick start
-
-```bash
-fb daemon status
-
-# Messenger
-fb chats --limit 20
-fb thread <thread_id>
-fb pull <thread_id>          # temp-download photos/files
-fb open ~/.local/state/fb/tmp/<id>/001-....jpg
-fb keep <id>                 # promote tmp → keep
-fb purge all
-
-# Public posts
-fb posts "search query" --limit 10
-fb post "https://www.facebook.com/photo/?fbid=..."
-fb research "topic" --limit 3
-
-# JSON for scripts / agents
-fb chats --json
-fb post "<url>" --json
-```
-
-Default window mode is **background** (invisible). Debug with:
-
-```bash
-fb --window foreground whoami
+fb-service install
+systemctl --user enable --now fb-chrome-lean   # uses your real Default profile
+loginctl enable-linger $USER                   # survive logout
 ```
 
 ---
 
-## Architecture
+## Auth model (honest)
 
-| Piece | Role | Weight |
-|-------|------|--------|
-| `fb` | User CLI | tiny |
-| opencli adapters in `~/.opencli/clis/facebook/` | Messenger + posts | tiny |
-| opencli daemon | Extension bridge | ~20–80 MB |
-| Chrome + OpenCLI ext | Session + DOM | your browser |
+- **Not** QR multi-device like WhatsApp `wacli`  
+- **Yes** your normal Facebook login in Chrome  
+- Session lasts while Chrome stays logged in  
 
-**Auth** = Chrome cookies for facebook.com (not a QR linked-device session).
-
----
-
-## Repo layout
-
-```text
-fb-cli/
-  adapters/facebook/   # opencli site adapters
-  bin/                 # fb, fb-service, fb-chrome-lean
-  systemd/             # user units (templated by install)
-  scripts/install.sh
-  README.md
-  LICENSE
-```
-
----
-
-## Limitations
-
-- Public / visible content only (what your account can see in the browser)  
-- Facebook UI changes can break selectors  
-- Not official Meta API; use at your own risk  
-- Feed scraping is flaky; Messenger + post deep-read are stronger  
-- Not a drop-in for `wacli` protocol-level offline sync  
+Details: [docs/AUTH.md](./docs/AUTH.md)
 
 ---
 
 ## Uninstall
 
 ```bash
-fb-service uninstall   # if you installed units
+fb-service uninstall
 rm -rf ~/.opencli/clis/facebook
 rm -f ~/bin/fb ~/bin/fb-service ~/bin/fb-chrome-lean
-# optional: rm -rf ~/.local/state/fb
 ```
-
----
 
 ## License
 
-MIT — see [LICENSE](./LICENSE).
-
-OpenCLI is separate software ([@jackwener/opencli](https://www.npmjs.com/package/@jackwener/opencli)).
+MIT

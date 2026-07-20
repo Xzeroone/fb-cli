@@ -12,7 +12,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 
-const VERSION = '0.4.0';
+const VERSION = '0.5.0';
+const OPENCLI_EXT_URL =
+  process.env.FB_OPENCLI_EXT_URL ||
+  'https://chromewebstore.google.com/detail/opencli/ildkmabpimmkaediidaifkhjpohdnifk';
+const FACEBOOK_LOGIN_URL = 'https://www.facebook.com/login';
 const STORE_DIR = process.env.FB_STORE_DIR || path.join(os.homedir(), '.local/state/fb');
 const DB_PATH = path.join(STORE_DIR, 'fb.db');
 const DAEMON_STATE = path.join(STORE_DIR, 'daemon.json');
@@ -355,6 +359,190 @@ function cmdDaemon(sub, g) {
   process.exit(2);
 }
 
+function openInBrowser(url) {
+  const candidates = [
+    ['google-chrome', [url]],
+    ['google-chrome-stable', [url]],
+    ['chromium', [url]],
+    ['chromium-browser', [url]],
+    ['xdg-open', [url]],
+  ];
+  for (const [bin, args] of candidates) {
+    const which = spawnSync('which', [bin], { encoding: 'utf8' });
+    if (which.status !== 0) continue;
+    const child = spawn(bin, args, { detached: true, stdio: 'ignore' });
+    child.unref();
+    return bin;
+  }
+  console.error(`Open this URL manually: ${url}`);
+  return null;
+}
+
+function sleepMs(ms) {
+  spawnSync('sleep', [String(ms / 1000)]);
+}
+
+function doctorConnected() {
+  const r = spawnSync(OPENCLI, ['doctor'], { encoding: 'utf8', timeout: 45000 });
+  const out = `${r.stdout || ''}\n${r.stderr || ''}`;
+  const ok =
+    r.status === 0 &&
+    (/Extension:\s*connected/i.test(out) || /Everything looks good/i.test(out));
+  return { ok, out, status: r.status };
+}
+
+function facebookLoggedIn() {
+  const r = opencli(['facebook', 'whoami', '-f', 'json'], {
+    json: true,
+    timeout: 90000,
+    windowMode: 'background',
+  });
+  const me = r.status === 0 ? tryParseJson(r.stdout) : null;
+  const ok = Boolean(me && (me.logged_in === true || me.user_id));
+  return { ok, me, raw: r };
+}
+
+/** Guided one-time connect: open store → click install → FB login → magic. */
+function cmdSetup(g) {
+  const timeoutMs = Number(process.env.FB_SETUP_TIMEOUT_MS || 10 * 60 * 1000);
+  const pollMs = Number(process.env.FB_SETUP_POLL_MS || 4000);
+  const started = Date.now();
+
+  console.log('');
+  console.log('╔══════════════════════════════════════════════════════╗');
+  console.log('║  fb setup — connect once, then everything is magic ║');
+  console.log('╚══════════════════════════════════════════════════════╝');
+  console.log('');
+  console.log('You only need to click a few things in Chrome.');
+  console.log('I will open the right tabs and wait.');
+  console.log('');
+
+  // Ensure opencli daemon is up
+  spawnSync(OPENCLI, ['daemon', 'restart'], { encoding: 'utf8', timeout: 30000 });
+  sleepMs(1500);
+
+  // --- Step 1: extension ---
+  let d = doctorConnected();
+  if (d.ok) {
+    console.log('✓ OpenCLI extension already connected');
+  } else {
+    console.log('Step 1/2 — Install OpenCLI extension');
+    console.log('  → Opening Chrome Web Store…');
+    console.log('  → Click  “Add to Chrome”  /  “Install”  in the tab that opens');
+    console.log(`  → ${OPENCLI_EXT_URL}`);
+    console.log('');
+    openInBrowser(OPENCLI_EXT_URL);
+    // also try to ensure chrome is up with facebook later
+    process.stdout.write('  Waiting for extension');
+    while (Date.now() - started < timeoutMs) {
+      d = doctorConnected();
+      if (d.ok) {
+        console.log('');
+        console.log('✓ Extension connected');
+        break;
+      }
+      process.stdout.write('.');
+      sleepMs(pollMs);
+    }
+    if (!d.ok) {
+      console.log('');
+      console.error('✗ Timed out waiting for OpenCLI extension.');
+      console.error('  Make sure you clicked Install, then re-run:  fb setup');
+      console.error('  Debug: opencli doctor');
+      process.exit(1);
+    }
+  }
+
+  // --- Step 2: Facebook session ---
+  let auth = facebookLoggedIn();
+  if (auth.ok) {
+    console.log(`✓ Facebook already logged in (user_id=${auth.me.user_id || '?'})`);
+  } else {
+    console.log('');
+    console.log('Step 2/2 — Log into Facebook');
+    console.log('  → Opening Facebook login…');
+    console.log('  → Sign in / complete 2FA in the browser tab');
+    console.log('');
+    openInBrowser(FACEBOOK_LOGIN_URL);
+    // also trigger opencli login flow (foreground) in parallel-ish
+    spawn(
+      OPENCLI,
+      ['facebook', 'login', '--window', 'foreground'],
+      { detached: true, stdio: 'ignore', env: { ...process.env, OPENCLI_WINDOW: 'foreground' } },
+    ).unref();
+
+    process.stdout.write('  Waiting for Facebook session');
+    while (Date.now() - started < timeoutMs) {
+      auth = facebookLoggedIn();
+      if (auth.ok) {
+        console.log('');
+        console.log(`✓ Logged in (user_id=${auth.me.user_id || '?'})`);
+        break;
+      }
+      process.stdout.write('.');
+      sleepMs(pollMs);
+    }
+    if (!auth.ok) {
+      console.log('');
+      console.error('✗ Timed out waiting for Facebook login.');
+      console.error('  Finish login in Chrome, then re-run:  fb setup');
+      console.error('  Or:  fb auth');
+      process.exit(1);
+    }
+  }
+
+  hideChromeWindows();
+
+  // optional services (non-fatal)
+  if (process.env.FB_SETUP_SERVICES !== '0') {
+    const hasSystemd =
+      spawnSync('systemctl', ['--user', 'status'], { encoding: 'utf8' }).status === 0 ||
+      fs.existsSync(path.join(os.homedir(), '.config/systemd/user'));
+    if (hasSystemd) {
+      console.log('');
+      console.log('Enabling lightweight background services…');
+      const svc = path.join(os.homedir(), 'bin/fb-service');
+      if (fs.existsSync(svc)) {
+        spawnSync(svc, ['install'], { encoding: 'utf8', timeout: 60000 });
+      }
+      spawnSync(
+        'systemctl',
+        ['--user', 'enable', '--now', 'fb-chrome-lean.service'],
+        { encoding: 'utf8', timeout: 30000 },
+      );
+      hideChromeWindows();
+    }
+  }
+
+  console.log('');
+  console.log('══════════════════════════════════════════════════════');
+  console.log('  All set. Rest is magic.');
+  console.log('');
+  console.log('  Try:');
+  console.log('    fb whoami');
+  console.log('    fb chats --limit 10');
+  console.log('    fb posts "something" --limit 5');
+  console.log('    fb research "topic" --limit 2');
+  console.log('══════════════════════════════════════════════════════');
+  console.log('');
+
+  if (g.json) {
+    console.log(
+      JSON.stringify(
+        {
+          ok: true,
+          extension: true,
+          authenticated: true,
+          user_id: auth.me?.user_id || null,
+        },
+        null,
+        2,
+      ),
+    );
+  }
+  process.exit(0);
+}
+
 function printRaw(result, { json }) {
   if (result.stdout) process.stdout.write(result.stdout.endsWith('\n') ? result.stdout : result.stdout + '\n');
   if (result.stderr && result.status !== 0) {
@@ -440,6 +628,9 @@ function usage() {
 
 Usage:
   fb <command> [args] [options]
+
+Setup (do this first — magic after):
+  fb setup                 Guided connect: open extension store → wait → FB login → done
 
 Daemon / services (lightweight):
   fb daemon install        Install systemd user units (opencli + hide timer)
@@ -788,6 +979,11 @@ function main() {
   const [cmd, ...args] = g.rest;
 
   switch (cmd) {
+    case 'setup':
+    case 'connect':
+    case 'onboard':
+      cmdSetup(g);
+      break;
     case 'daemon':
       cmdDaemon(args[0], g);
       break;
