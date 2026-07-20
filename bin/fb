@@ -161,12 +161,20 @@ function listChromeWindowIds() {
 function hideWindowIds(ids) {
   let n = 0;
   for (const id of ids) {
-    // minimize + unfocus + park off-screen (opencli creates 1280x900 "owned" windows)
     spawnSync('wmctrl', ['-i', '-r', id, '-b', 'add,hidden,below'], { encoding: 'utf8' });
-    spawnSync('wmctrl', ['-i', '-r', id, '-b', 'add,shaded'], { encoding: 'utf8' });
     spawnSync('wmctrl', ['-i', '-r', id, '-e', '0,-32000,-32000,100,100'], { encoding: 'utf8' });
-    // xdotool minimize if available
     spawnSync('xdotool', ['windowminimize', id], { encoding: 'utf8' });
+    n += 1;
+  }
+  return n;
+}
+
+/** Close windows (used for opencli automation popups after a command). */
+function closeWindowIds(ids) {
+  let n = 0;
+  for (const id of ids) {
+    // wmctrl -c = close window gracefully
+    spawnSync('wmctrl', ['-i', '-c', id], { encoding: 'utf8' });
     n += 1;
   }
   return n;
@@ -183,19 +191,32 @@ function hideChromeWindows() {
   }
 }
 
-/** Hide only windows that appeared during a command (opencli automation windows). */
-function hideNewChromeWindows(beforeIds) {
+/**
+ * Close only windows that appeared during a command (opencli "owned" automation windows).
+ * Never touches windows that already existed before the command.
+ */
+function closeNewChromeWindows(beforeIds) {
   try {
     const after = listChromeWindowIds();
     const before = new Set(beforeIds || []);
     const created = after.filter((id) => !before.has(id));
-    // Also re-hide any chrome window that is focused and looks like automation
-    // (title often blank/facebook while user was on another workspace)
-    const n = hideWindowIds(created);
+    if (!created.length) return { ok: true, windows: 0, created: [] };
+    // small delay so opencli can finish tab teardown
+    spawnSync('sleep', ['0.25']);
+    const n = closeWindowIds(created);
+    // if close failed / raced, force hide leftovers
+    spawnSync('sleep', ['0.2']);
+    const still = listChromeWindowIds().filter((id) => created.includes(id));
+    if (still.length) hideWindowIds(still);
     return { ok: true, windows: n, created };
   } catch (e) {
     return { ok: false, reason: String(e.message || e) };
   }
+}
+
+/** @deprecated name kept for callers — now closes new windows */
+function hideNewChromeWindows(beforeIds) {
+  return closeNewChromeWindows(beforeIds);
 }
 
 function opencli(args, { json = true, timeout = 180000, windowMode, hidePopups = true } = {}) {
