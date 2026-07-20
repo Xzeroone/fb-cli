@@ -1,0 +1,14 @@
+[Unit]
+Description=fb: keep Chrome backend windows hidden (oneshot)
+After=fb-opencli.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/bin/fb daemon hide
+Environment=PATH=%h/bin:%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+Environment=FB_WINDOW=background
+Nice=10
+IOSchedulingClass=idle
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fb-hide

@@ -1,0 +1,30 @@
+[Unit]
+Description=fb/opencli bridge daemon (lightweight Facebook CLI backend)
+Documentation=https://github.com/openclaw/wacli
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# OPENCLI_DAEMON filled by install.sh
+ExecStart=__NODE__ __OPENCLI_DAEMON__
+WorkingDirectory=%h
+Environment=HOME=%h
+Environment=PATH=%h/.local/bin:%h/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+Environment=OPENCLI_WINDOW=background
+Environment=FB_WINDOW=background
+Environment=NODE_ENV=production
+MemoryMax=128M
+MemoryHigh=96M
+TasksMax=64
+Restart=on-failure
+RestartSec=3
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fb-opencli
+
+[Install]
+WantedBy=default.target

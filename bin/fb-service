@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# Lightweight systemd installer / manager for fb backend.
+set -euo pipefail
+
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+OPENCLI_UNIT="fb-opencli.service"
+HIDE_TIMER="fb-hide.timer"
+CHROME_UNIT="fb-chrome-lean.service"
+
+usage() {
+  cat <<'EOF'
+fb-service — install/manage lightweight fb systemd user units
+
+  fb-service install     Install + enable opencli daemon + hide timer (recommended)
+  fb-service uninstall   Disable + stop units
+  fb-service start|stop|restart|status
+  fb-service enable-chrome   Optional lean Chrome (heavy — only if needed)
+  fb-service disable-chrome
+  fb-service linger-on   Survive logout (loginctl enable-linger)
+  fb-service linger-off
+
+Lightweight stack (default install):
+  • fb-opencli.service  ~60–80 MB  Node bridge on :19825
+  • fb-hide.timer       ~0 MB idle, re-hides Chrome every 10m
+  • Chrome              NOT started — reuse your desktop Chrome + OpenCLI extension
+
+Heavy optional:
+  • fb-chrome-lean.service  ~400MB–1GB  always-on off-screen Chrome
+EOF
+}
+
+need_systemctl() {
+  command -v systemctl >/dev/null || { echo "systemctl not found"; exit 1; }
+}
+
+cmd_install() {
+  need_systemctl
+  mkdir -p "$UNIT_DIR"
+  # stop any ad-hoc opencli daemon so the unit owns the port
+  if command -v opencli >/dev/null; then
+    opencli daemon stop 2>/dev/null || true
+    sleep 0.5
+  fi
+  systemctl --user daemon-reload
+  systemctl --user enable --now "$OPENCLI_UNIT"
+  systemctl --user enable --now "$HIDE_TIMER"
+  # run hide once now
+  systemctl --user start fb-hide.service 2>/dev/null || true
+  echo "Installed lightweight stack:"
+  echo "  systemctl --user status $OPENCLI_UNIT"
+  systemctl --user --no-pager --full status "$OPENCLI_UNIT" | head -20 || true
+  echo
+  echo "Chrome: keep your normal Chrome open (logged into Facebook + OpenCLI extension)."
+  echo "Optional always-on Chrome:  fb-service enable-chrome"
+  echo "Survive logout:             fb-service linger-on"
+}
+
+cmd_uninstall() {
+  need_systemctl
+  systemctl --user disable --now "$HIDE_TIMER" 2>/dev/null || true
+  systemctl --user disable --now "$OPENCLI_UNIT" 2>/dev/null || true
+  systemctl --user disable --now "$CHROME_UNIT" 2>/dev/null || true
+  systemctl --user daemon-reload
+  echo "fb user services disabled."
+}
+
+cmd_enable_chrome() {
+  need_systemctl
+  chmod +x "$HOME/bin/fb-chrome-lean" 2>/dev/null || true
+  systemctl --user daemon-reload
+  systemctl --user enable --now "$CHROME_UNIT"
+  sleep 3
+  $HOME/bin/fb daemon hide 2>/dev/null || true
+  echo "Chrome backend enabled — uses your REAL profile:"
+  echo "  user-data: ~/.config/google-chrome"
+  echo "  profile:   Default (existing cookies + OpenCLI extension)"
+  echo "  status:    systemctl --user status $CHROME_UNIT"
+  echo
+  echo "No re-login needed if you're already logged into Facebook in Chrome."
+  echo "Modes: edit FB_CHROME_MODE in the unit (auto|hidden|headless)"
+  echo "  systemctl --user edit fb-chrome-lean.service"
+}
+
+cmd_disable_chrome() {
+  need_systemctl
+  systemctl --user disable --now "$CHROME_UNIT" 2>/dev/null || true
+  echo "Lean Chrome disabled."
+}
+
+case "${1:-}" in
+  install) cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  start) systemctl --user start "$OPENCLI_UNIT" "$HIDE_TIMER" ;;
+  stop) systemctl --user stop "$OPENCLI_UNIT" ;;
+  restart) systemctl --user restart "$OPENCLI_UNIT" ;;
+  status)
+    systemctl --user --no-pager --full status "$OPENCLI_UNIT" 2>&1 | head -25
+    echo "---"
+    systemctl --user --no-pager --full status "$HIDE_TIMER" 2>&1 | head -15
+    echo "---"
+    $HOME/bin/fb daemon status 2>&1 | head -15
+    ;;
+  enable-chrome) cmd_enable_chrome ;;
+  disable-chrome) cmd_disable_chrome ;;
+  linger-on) loginctl enable-linger "$USER"; echo "linger enabled for $USER" ;;
+  linger-off) loginctl disable-linger "$USER"; echo "linger disabled" ;;
+  -h|--help|help|"") usage ;;
+  *) echo "Unknown: $1"; usage; exit 2 ;;
+esac

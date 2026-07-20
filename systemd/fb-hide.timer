@@ -1,0 +1,12 @@
+[Unit]
+Description=fb: periodically re-hide Chrome backend windows
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+AccuracySec=1min
+Persistent=true
+Unit=fb-hide.service
+
+[Install]
+WantedBy=timers.target
