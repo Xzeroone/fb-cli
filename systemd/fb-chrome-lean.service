@@ -12,7 +12,8 @@ ExecStart=%h/bin/fb-chrome-lean
 Environment=HOME=%h
 Environment=FB_CHROME_USER_DATA=%h/.config/google-chrome
 Environment=FB_CHROME_PROFILE_DIR=Default
-Environment=FB_CHROME_MODE=auto
+# attach = never spawn Chrome; wait for your normal Chrome (no new windows)
+Environment=FB_CHROME_MODE=attach
 Restart=on-failure
 RestartSec=5
 MemoryMax=2G

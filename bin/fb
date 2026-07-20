@@ -147,59 +147,104 @@ function parseGlobalArgs(argv) {
   return out;
 }
 
-function opencli(args, { json = true, timeout = 180000, windowMode } = {}) {
+function listChromeWindowIds() {
+  const list = spawnSync('wmctrl', ['-lx'], { encoding: 'utf8' });
+  if (list.status !== 0 || !list.stdout) return [];
+  // wmctrl -lx: id desktop class host title
+  return list.stdout
+    .split('\n')
+    .filter((l) => /google-chrome|chromium|Google-chrome|Chromium/i.test(l))
+    .map((l) => l.split(/\s+/)[0])
+    .filter(Boolean);
+}
+
+function hideWindowIds(ids) {
+  let n = 0;
+  for (const id of ids) {
+    // minimize + unfocus + park off-screen (opencli creates 1280x900 "owned" windows)
+    spawnSync('wmctrl', ['-i', '-r', id, '-b', 'add,hidden,below'], { encoding: 'utf8' });
+    spawnSync('wmctrl', ['-i', '-r', id, '-b', 'add,shaded'], { encoding: 'utf8' });
+    spawnSync('wmctrl', ['-i', '-r', id, '-e', '0,-32000,-32000,100,100'], { encoding: 'utf8' });
+    // xdotool minimize if available
+    spawnSync('xdotool', ['windowminimize', id], { encoding: 'utf8' });
+    n += 1;
+  }
+  return n;
+}
+
+function hideChromeWindows() {
+  try {
+    const ids = listChromeWindowIds();
+    if (!ids.length) return { ok: true, windows: 0 };
+    const n = hideWindowIds(ids);
+    return { ok: true, windows: n };
+  } catch (e) {
+    return { ok: false, reason: String(e.message || e) };
+  }
+}
+
+/** Hide only windows that appeared during a command (opencli automation windows). */
+function hideNewChromeWindows(beforeIds) {
+  try {
+    const after = listChromeWindowIds();
+    const before = new Set(beforeIds || []);
+    const created = after.filter((id) => !before.has(id));
+    // Also re-hide any chrome window that is focused and looks like automation
+    // (title often blank/facebook while user was on another workspace)
+    const n = hideWindowIds(created);
+    return { ok: true, windows: n, created };
+  } catch (e) {
+    return { ok: false, reason: String(e.message || e) };
+  }
+}
+
+function opencli(args, { json = true, timeout = 180000, windowMode, hidePopups = true } = {}) {
   const cmdArgs = [...args];
   if (json && !cmdArgs.includes('-f') && !cmdArgs.includes('--format')) {
     cmdArgs.push('-f', 'json');
   }
   // Force background unless caller already set --window.
-  // Put flags at the END so `facebook whoami --window background` parses correctly.
   const hasWindow = cmdArgs.includes('--window');
   const mode = windowMode || DEFAULT_WINDOW;
-  if (!hasWindow && (mode === 'background' || mode === 'foreground')) {
-    // only for browser-backed commands (facebook / browser)
-    if (cmdArgs[0] === 'facebook' || cmdArgs[0] === 'browser') {
-      cmdArgs.push('--window', mode);
-    }
+  const isBrowserCmd = cmdArgs[0] === 'facebook' || cmdArgs[0] === 'browser';
+  if (!hasWindow && (mode === 'background' || mode === 'foreground') && isBrowserCmd) {
+    cmdArgs.push('--window', mode);
   }
+  // Reuse one automation container instead of spawning new windows each call
+  if (isBrowserCmd && !cmdArgs.includes('--site-session')) {
+    cmdArgs.push('--site-session', 'persistent');
+  }
+  // Don't leave leased tabs around when ephemeral would close them — persistent reuses
+  if (isBrowserCmd && !cmdArgs.includes('--keep-tab') && mode === 'background') {
+    cmdArgs.push('--keep-tab', 'false');
+  }
+
   const env = {
     ...process.env,
     OPENCLI_WINDOW: mode,
   };
+
+  const beforeWins = hidePopups && mode === 'background' ? listChromeWindowIds() : [];
   const r = spawnSync(OPENCLI, cmdArgs, {
     encoding: 'utf8',
     maxBuffer: 30 * 1024 * 1024,
     timeout,
     env,
   });
+  if (hidePopups && mode === 'background') {
+    // opencli creates an "owned" window (unfocused but still visible). Hide only new ones
+    // so the user's existing Chrome windows are not nuked.
+    hideNewChromeWindows(beforeWins);
+    // second pass after a beat — extension sometimes focuses late
+    spawnSync('sleep', ['0.35']);
+    hideNewChromeWindows(beforeWins);
+  }
   return {
     status: r.status ?? 1,
     stdout: r.stdout || '',
     stderr: r.stderr || '',
     error: r.error,
   };
-}
-
-function hideChromeWindows() {
-  // Best-effort: keep Chrome running for the extension, but off-screen / minimized.
-  try {
-    const list = spawnSync('wmctrl', ['-l'], { encoding: 'utf8' });
-    if (list.status !== 0 || !list.stdout) return { ok: false, reason: 'wmctrl unavailable' };
-    const lines = list.stdout.split('\n').filter((l) => /chrome|chromium|google-chrome/i.test(l));
-    let n = 0;
-    for (const line of lines) {
-      const id = line.split(/\s+/)[0];
-      if (!id) continue;
-      // minimize
-      spawnSync('wmctrl', ['-i', '-r', id, '-b', 'add,hidden,below'], { encoding: 'utf8' });
-      // also park far off-screen
-      spawnSync('wmctrl', ['-i', '-r', id, '-e', '0,-32000,-32000,-1,-1'], { encoding: 'utf8' });
-      n += 1;
-    }
-    return { ok: true, windows: n };
-  } catch (e) {
-    return { ok: false, reason: String(e.message || e) };
-  }
 }
 
 function writeDaemonState(state) {
