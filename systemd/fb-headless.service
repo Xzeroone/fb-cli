@@ -1,0 +1,22 @@
+[Unit]
+Description=fb headless Chrome CDP on :9223 (minimal profile)
+Documentation=https://github.com/Xzeroone/fb-cli
+After=network-online.target fb-opencli.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=%h/bin/fb-headless start
+ExecStop=%h/bin/fb-headless stop
+Environment=HOME=%h
+Environment=PATH=%h/bin:%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+# Profile lives under ~/.local/state/fb/chrome (not the real Default profile)
+TimeoutStartSec=90
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fb-headless
+
+[Install]
+WantedBy=default.target

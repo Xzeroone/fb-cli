@@ -1169,9 +1169,10 @@ Config (JSON5, comments ok):
   ${CONFIG_PATH}    — { "account": "work", "store": "/srv/fb", "readOnly": true }
 
 Notes:
-  • v0.7.0 dropped: wmctrl/xdotool, fb-hide.timer, fb-chrome-lean, fb-service.
+  • v0.7.0 dropped: wmctrl/xdotool, fb-hide.timer, fb-chrome-lean as defaults.
+  • Always-on: fb-service install  (fb-opencli + fb-headless on :9223).
   • All exit codes are deterministic: 0=ok, 2=usage, 3=not-authed, 4=not-found, 5=read-only, 6=locked, 7=opencli-fail.
-  • For zero-UI mode:  fb-headless start  →  FB_CHROME_ENDPOINT=http://127.0.0.1:9223 fb whoami
+  • For zero-UI mode:  fb-headless start  (auto-preferred when :9223 is up)
 `,
 };
 

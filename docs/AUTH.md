@@ -1,34 +1,37 @@
-# Auth flow (for end users)
+# Auth — how fb stays logged in
 
-## Goal
+## Model
 
-One-time setup so `fb` can use **their** Facebook session. No QR multi-device API exists for personal Facebook.
+fb does **not** implement Meta OAuth or QR multi-device login.
 
-## Steps (copy into README demos)
+1. You log into facebook.com in **normal Chrome** (your Default profile).  
+2. `fb-headless start` copies a **minimal** slice of that profile into  
+   `~/.local/state/fb/chrome`:  
+   - OpenCLI extension  
+   - Cookies (incl. `c_user`, `xs`, `fr`, `datr`)  
+   - `Local State` (cookie encryption key)  
+   - Slim Preferences (OpenCLI only)  
+3. Headless Chrome on **:9223** uses that copy. opencli + the extension drive Facebook.  
+4. If headless is down, fb falls back to visible Chrome CDP on **:9222**.
 
-1. **Chrome** installed  
-2. **OpenCLI extension** from Chrome Web Store  
-3. **Log into facebook.com** in that same Chrome profile  
-4. `opencli doctor` → extension connected  
-5. `fb whoami` → `logged_in: true`  
+## Refresh
 
-If step 5 fails: `fb auth` (visible login once).
+The headless profile is **not** continuously synced.
 
-## Why this is “easy enough”
+```bash
+fb-headless reset && fb-headless start
+fb whoami
+```
 
-- Same skills as “install a Chrome extension and log into a website”  
-- No API keys, no Meta developer app, no phone pairing codes  
-- Session lasts as long as Chrome stays logged into Facebook  
+## Failure modes
 
-## Why it fails for some people
+| Symptom | Fix |
+|---------|-----|
+| `Browser Bridge extension not connected` | Install OpenCLI in **visible** Chrome, then reset headless |
+| `not logged in` / empty whoami | Log into FB in visible Chrome, then reset headless |
+| SingletonLock / default data directory errors | Never point headless at `~/.config/google-chrome` as data dir — use `fb-headless` |
+| CDP not reachable | `fb-headless start` or `systemctl --user start fb-headless` |
 
-- Corporate locked-down Chrome (no extensions)  
-- Only Firefox / Safari  
-- Pure SSH server with no display and no Chrome  
-- Expecting WhatsApp-style QR without a browser  
+## Privacy
 
-## Security notes for README
-
-- Treat Chrome profile + `~/.local/state/fb` as sensitive  
-- Don’t commit cookies or `fb.db`  
-- Automation may violate Meta ToS — personal/research use only  
+Cookies and profile data stay on disk under `~/.local/state/fb/`. Do not commit that tree.

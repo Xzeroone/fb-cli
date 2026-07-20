@@ -3,12 +3,11 @@
 Connect Chrome **once**. Everything after that is magic.
 
 ```text
-fb  →  opencli  →  your Chrome (cookies + OpenCLI extension)
+fb  →  opencli  →  headless Chrome :9223  (cookies + OpenCLI extension)
+                 ↘ fallback visible Chrome :9222
 ```
 
-Optional: skip Chrome entirely with a dedicated headless profile.
-
-Not affiliated with Meta. Public / visible content only.
+**v0.7.0** — headless-by-default. Not affiliated with Meta. Public / visible content only.
 
 ---
 
@@ -28,16 +27,43 @@ That installs packages, then runs **`fb setup`** automatically.
 
 ---
 
+## Architecture (v0.7)
+
+| Piece | Port / path | Role |
+|-------|-------------|------|
+| `opencli` daemon | `:19825` | Node bridge |
+| OpenCLI extension | in Chrome | talks to daemon |
+| Headless Chrome | `:9223` | dedicated minimal profile (`~/.local/state/fb/chrome`) |
+| Visible Chrome | `:9222` | fallback if headless is down |
+
+`fb-headless` copies a **minimal** slice of your real
+`~/.config/google-chrome/Default` (not a second login):
+
+- OpenCLI extension files only  
+- Cookies + Local State (decrypt key)  
+- Preferences / Secure Preferences **unmodified** (HMAC trust for OpenCLI)  
+- Non-Facebook cookies trimmed **before** Chrome starts  
+
+Typical size: **~5–20 MB** disk, not hundreds of MB.
+
+Re-copy after re-auth in visible Chrome:
+
+```bash
+fb-headless reset && fb-headless start
+```
+
+---
+
 ## `fb setup` — what you click, what we automate
 
 | You do (once) | We automate |
 |---------------|-------------|
 | Click **Add to Chrome** on the store tab | Open the OpenCLI extension page |
 | Log into Facebook if asked | Open login, poll until session works |
-| — | Install adapters, binaries, optional systemd unit |
-| — | Optionally: launch a headless Chrome so you don't need a visible window |
+| — | Install adapters, bins, optional systemd |
+| — | Start headless Chrome on :9223 |
 
-Chrome **cannot** silently install Web Store extensions (browser security). One click is the only human step for the extension.
+Chrome **cannot** silently install Web Store extensions. One click is the only human step for the extension.
 
 ```bash
 fb setup          # re-run anytime if disconnected
@@ -45,42 +71,76 @@ fb setup          # re-run anytime if disconnected
 
 ---
 
-## Headless mode (no Chrome window)
-
-Default `fb` uses whatever Chrome you have open. If you don't want a visible Chrome window:
+## After setup
 
 ```bash
-fb-headless start    # launches a dedicated headless Chrome on :9223
-fb-headless status
-fb-headless stop
-fb-headless reset     # wipe + re-copy the headless profile
+fb whoami
+fb chats --limit 20
+fb thread <id>
+fb pull <thread_or_post_url>
+fb posts "query" --limit 10
+fb post "<url>"
+fb research "topic" --limit 3
 ```
-
-The headless Chrome uses its own profile with just the OpenCLI extension and your facebook.com cookies (everything else is purged on first start). It runs in parallel with your normal Chrome without conflicts.
 
 ---
 
-## Point your agent at it
+## Headless ops
+
+```bash
+fb-headless start|stop|restart|status|logs|reset
+fb status
+# force CDP:
+FB_CHROME_ENDPOINT=http://127.0.0.1:9223 fb whoami
+```
+
+---
+
+## Optional always-on (Linux)
+
+```bash
+fb-service install                 # opencli + headless units
+loginctl enable-linger $USER       # survive logout
+# or:
+systemctl --user enable --now fb-opencli.service fb-headless.service
+```
+
+---
+
+## Requirements
+
+- Node.js ≥ 20  
+- Google Chrome  
+- Linux recommended for systemd extras  
+
+---
+
+## Auth model (honest)
+
+- **Not** QR multi-device like WhatsApp `wacli`  
+- **Yes** your normal Facebook login in Chrome  
+- Headless profile is a **one-shot cookie copy** — re-login in visible Chrome, then `fb-headless reset && start`  
+
+Details: [docs/AUTH.md](./docs/AUTH.md)
+
+---
+
+## Agent notes
 
 See **[AGENTS.md](./AGENTS.md)**.
 
-Agent summary:
-
-1. Run the one-liner / `get-fb.sh`  
-2. Tell the human: *"Click Add to Chrome, then finish Facebook login if a tab appears."*  
-3. Wait for `fb setup` to exit 0  
-4. Use `fb … --json`  
-
 ---
 
-## Version
+## Uninstall
 
-**0.7.0** — headless-by-default, no wmctrl/xdotool, no window-hide dance, no required systemd units.
-
-Previous versions managed a Chrome window and used `wmctrl`/`xdotool` to keep it hidden. That dance is gone. v0.7.0 just talks to whatever Chrome (visible or headless) is already running on :9222/:9223, and auto-starts the opencli daemon + a headless Chrome if neither is reachable.
-
----
+```bash
+fb-service uninstall
+rm -rf ~/.opencli/clis/facebook
+rm -f ~/bin/fb ~/bin/fb-service ~/bin/fb-headless
+# optional: wipe store + headless profile
+# rm -rf ~/.local/state/fb
+```
 
 ## License
 
-MIT — see [LICENSE](./LICENSE).
+MIT

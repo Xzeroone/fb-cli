@@ -1,6 +1,7 @@
 # Agent instructions — fb-cli
 
-You are setting up or using **fb**, a Facebook/Messenger CLI that drives the user's **real Chrome session** via opencli.
+You are setting up or using **fb**, a Facebook/Messenger CLI that drives a
+**Chrome session** via opencli. Default transport is **headless Chrome on :9223**.
 
 ## One-liner install (human or agent)
 
@@ -20,7 +21,9 @@ git clone <repo> && cd fb-cli && ./scripts/install.sh && fb setup
 
 ## What you must get the human to do (cannot fully automate)
 
-Chrome **blocks silent Web Store installs**. The human must click **Add to Chrome** once.
+Chrome **blocks silent Web Store installs**. The human must click **Add to Chrome** once
+(in their **visible** Chrome). That installs the OpenCLI extension into the real profile;
+`fb-headless` then copies it + cookies into the headless profile.
 
 `fb setup` automates everything else:
 
@@ -28,6 +31,7 @@ Chrome **blocks silent Web Store installs**. The human must click **Add to Chrom
 2. Polls until the extension connects  
 3. Opens Facebook login  
 4. Polls until `fb whoami` succeeds  
+5. Optionally enables systemd (`fb-service install`)  
 
 Tell the human: **"Click Add to Chrome / Install when the store tab opens, then log into Facebook if asked. I'll wait."**
 
@@ -45,32 +49,32 @@ fb research "query" --limit 3
 
 Always prefer `--json` when parsing.
 
-## Optional: headless mode (no visible Chrome)
+## Architecture (v0.7)
 
-If the user doesn't want a Chrome window open, or is on a headless server:
-
-```bash
-fb-headless start
-fb whoami
-fb-headless stop     # when done
-```
-
-`fb-headless` launches a dedicated headless Chrome with a minimal profile (just the OpenCLI extension and facebook.com cookies — everything else is purged on first run). `fb` will prefer the headless Chrome on :9223 if it's running, falling back to the user's visible Chrome on :9222.
-
-## Architecture constraints
-
-- v0.7.0+: headless-by-default; no wmctrl, no xdotool, no window-hide systemd units
-- Auth = Chrome cookies for facebook.com (copied into the headless profile on first start)
-- Backend can run with **zero visible UI** via `fb-headless start`
-- Public / visible content only
+- Default: **headless CDP** `http://127.0.0.1:9223` via `fb-headless`  
+- Fallback: visible Chrome CDP `:9222`  
+- opencli daemon `:19825` + Browser Bridge extension  
+- Auth = Facebook cookies copied from `~/.config/google-chrome/Default`  
+- Headless profile: `~/.local/state/fb/chrome` (minimal — OpenCLI files + FB cookies; prefs unmodified for trust)  
+- Public / visible content only  
 
 ## Health checks
 
 ```bash
-opencli doctor                 # extension + daemon
-fb version                     # bridge status (daemon + chrome + extension)
-fb whoami                      # facebook session
-fb-headless status             # headless Chrome
+opencli doctor
+fb-headless status
+fb status
+fb whoami
+```
+
+## Session refresh
+
+If whoami fails after the user re-logged in the normal browser:
+
+```bash
+fb-headless reset
+fb-headless start
+fb whoami
 ```
 
 ## Do not
@@ -78,3 +82,6 @@ fb-headless status             # headless Chrome
 - Invent Meta API tokens  
 - Commit cookies, `~/.local/state/fb`, or Chrome profile data  
 - Promise QR pairing like WhatsApp wacli  
+- Use the real Default profile as `--user-data-dir` with headless (Chrome forbids it / SingletonLock)  
+- Slim Preferences JSON (breaks Secure Preferences HMAC → OpenCLI never connects)  
+- VACUUM the Cookies DB before Chrome opens it (can wipe the table)  

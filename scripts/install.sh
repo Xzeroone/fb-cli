@@ -120,6 +120,9 @@ info "daemon:  $DAEMON_JS"
 mkdir -p "$BIN_DIR" "$STORE"/{tmp,keep,cache} "$OPENCLI_CLIS" "$UNIT_DIR"
 install -m 755 "$ROOT/bin/fb" "$BIN_DIR/fb"
 install -m 755 "$ROOT/bin/fb-headless" "$BIN_DIR/fb-headless"
+if [[ -f "$ROOT/bin/fb-service" ]]; then
+  install -m 755 "$ROOT/bin/fb-service" "$BIN_DIR/fb-service"
+fi
 info "installed binaries → $BIN_DIR"
 
 # --- adapters ---
@@ -132,42 +135,40 @@ if ! echo ":$PATH:" | grep -q ":$BIN_DIR:"; then
   echo "  export PATH=\"$BIN_DIR:\$PATH\""
 fi
 
-# --- systemd (optional, just the opencli daemon) ---
+# --- systemd units (write files; enable via fb-service install) ---
 if command -v systemctl >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then
-  src="$ROOT/systemd/fb-opencli.service"
-  dst="$UNIT_DIR/fb-opencli.service"
-  sed \
-    -e "s|__NODE__|$NODE_BIN|g" \
-    -e "s|__OPENCLI_DAEMON__|$DAEMON_JS|g" \
-    -e "s|%h|$HOME_DIR|g" \
-    "$src" > "$dst"
-  systemctl --user daemon-reload
-  info "systemd user unit written → $dst"
-  yellow "Optional: enable the opencli daemon as a user service"
-  echo "  systemctl --user enable --now fb-opencli.service"
+  mkdir -p "$UNIT_DIR"
+  if [[ -f "$ROOT/systemd/fb-opencli.service" ]]; then
+    sed \
+      -e "s|__NODE__|$NODE_BIN|g" \
+      -e "s|__OPENCLI_DAEMON__|$DAEMON_JS|g" \
+      "$ROOT/systemd/fb-opencli.service" > "$UNIT_DIR/fb-opencli.service"
+  fi
+  if [[ -f "$ROOT/systemd/fb-headless.service" ]]; then
+    cp "$ROOT/systemd/fb-headless.service" "$UNIT_DIR/fb-headless.service"
+  fi
+  systemctl --user daemon-reload 2>/dev/null || true
+  info "systemd units written → $UNIT_DIR"
+  yellow "Enable always-on headless stack:"
+  echo "  fb-service install"
+  echo "  # or: systemctl --user enable --now fb-opencli.service fb-headless.service"
   echo "  loginctl enable-linger \"\$USER\"   # survive logout"
 else
-  yellow "systemd --user not available — skip unit (fb auto-starts the daemon on first call)"
+  yellow "systemd --user not available — use: fb-headless start"
 fi
 
-echo
 green "Install complete."
 echo
 echo "========== One-time setup (everyone needs this) =========="
 echo "1. Install the OpenCLI Chrome extension:"
 echo "   https://chromewebstore.google.com/detail/opencli/ildkmabpimmkaediidaifkhjpohdnifk"
 echo "2. Open Chrome and log into facebook.com (normal login / 2FA)."
-echo "3. Verify the bridge:"
-echo "   opencli doctor"
-echo "4. Verify the Facebook session:"
-echo "   fb whoami"
+echo "3. Start headless backend (or use fb-service install):"
+echo "   fb-headless start"
+echo "4. Verify:"
+echo "   opencli doctor && fb whoami"
 echo
-echo "========== Optional: zero-GUI headless mode =========="
-echo "If you don't want a Chrome window open while using fb:"
-echo "   fb-headless start    # launches a dedicated headless Chrome on :9223"
-echo "   fb-headless status   # check it"
-echo "   fb-headless stop     # kill it"
-echo "   fb-headless reset    # wipe + re-copy the headless profile"
-echo
-echo "Then any fb command will use the headless Chrome automatically."
+echo "========== Headless ops =========="
+echo "   fb-headless start|stop|restart|status|logs|reset"
+echo "   fb-service install   # always-on opencli + headless"
 echo "============================================================="
