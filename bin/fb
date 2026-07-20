@@ -219,23 +219,59 @@ function hideNewChromeWindows(beforeIds) {
   return closeNewChromeWindows(beforeIds);
 }
 
+/**
+ * Live suppressor: while opencli runs, immediately minimize/park NEW Chrome windows
+ * so automation feels background (spawnSync blocks Node, so use a side process).
+ */
+function startLiveWindowSuppressor(beforeIds) {
+  const before = (beforeIds || []).join(' ');
+  const script = `
+BEFORE=" ${before} "
+while true; do
+  wmctrl -lx 2>/dev/null | awk 'BEGIN{IGNORECASE=1} /google-chrome|chromium|Google-chrome/{print $1}' | while read -r id; do
+    [ -z "$id" ] && continue
+    case " $BEFORE " in
+      *" $id "*) continue ;;
+    esac
+    wmctrl -i -r "$id" -b add,hidden,below 2>/dev/null || true
+    wmctrl -i -r "$id" -b add,shaded 2>/dev/null || true
+    wmctrl -i -r "$id" -e '0,-32000,-32000,80,80' 2>/dev/null || true
+    xdotool windowminimize "$id" 2>/dev/null || true
+  done
+  sleep 0.08
+done
+`;
+  return spawn('bash', ['-c', script], { stdio: 'ignore', detached: false });
+}
+
+function stopLiveWindowSuppressor(child) {
+  if (!child?.pid) return;
+  try {
+    process.kill(child.pid, 'SIGTERM');
+  } catch {
+    /* gone */
+  }
+  try {
+    child.kill('SIGKILL');
+  } catch {
+    /* ignore */
+  }
+}
+
 function opencli(args, { json = true, timeout = 180000, windowMode, hidePopups = true } = {}) {
   const cmdArgs = [...args];
   if (json && !cmdArgs.includes('-f') && !cmdArgs.includes('--format')) {
     cmdArgs.push('-f', 'json');
   }
-  // Force background unless caller already set --window.
   const hasWindow = cmdArgs.includes('--window');
   const mode = windowMode || DEFAULT_WINDOW;
   const isBrowserCmd = cmdArgs[0] === 'facebook' || cmdArgs[0] === 'browser';
   if (!hasWindow && (mode === 'background' || mode === 'foreground') && isBrowserCmd) {
     cmdArgs.push('--window', mode);
   }
-  // Reuse one automation container instead of spawning new windows each call
   if (isBrowserCmd && !cmdArgs.includes('--site-session')) {
     cmdArgs.push('--site-session', 'persistent');
   }
-  // Don't leave leased tabs around when ephemeral would close them — persistent reuses
   if (isBrowserCmd && !cmdArgs.includes('--keep-tab') && mode === 'background') {
     cmdArgs.push('--keep-tab', 'false');
   }
@@ -245,26 +281,33 @@ function opencli(args, { json = true, timeout = 180000, windowMode, hidePopups =
     OPENCLI_WINDOW: mode,
   };
 
-  const beforeWins = hidePopups && mode === 'background' ? listChromeWindowIds() : [];
-  const r = spawnSync(OPENCLI, cmdArgs, {
-    encoding: 'utf8',
-    maxBuffer: 30 * 1024 * 1024,
-    timeout,
-    env,
-  });
-  if (hidePopups && mode === 'background') {
-    // opencli creates an "owned" window (unfocused but still visible). Hide only new ones
-    // so the user's existing Chrome windows are not nuked.
-    hideNewChromeWindows(beforeWins);
-    // second pass after a beat — extension sometimes focuses late
-    spawnSync('sleep', ['0.35']);
-    hideNewChromeWindows(beforeWins);
+  const quiet = hidePopups && mode === 'background' && isBrowserCmd;
+  const beforeWins = quiet ? listChromeWindowIds() : [];
+  let suppressor = null;
+  if (quiet) suppressor = startLiveWindowSuppressor(beforeWins);
+
+  let r;
+  try {
+    r = spawnSync(OPENCLI, cmdArgs, {
+      encoding: 'utf8',
+      maxBuffer: 30 * 1024 * 1024,
+      timeout,
+      env,
+    });
+  } finally {
+    if (suppressor) stopLiveWindowSuppressor(suppressor);
+    if (quiet) {
+      // finished → close automation windows completely
+      closeNewChromeWindows(beforeWins);
+      spawnSync('sleep', ['0.25']);
+      closeNewChromeWindows(beforeWins);
+    }
   }
   return {
-    status: r.status ?? 1,
-    stdout: r.stdout || '',
-    stderr: r.stderr || '',
-    error: r.error,
+    status: r?.status ?? 1,
+    stdout: r?.stdout || '',
+    stderr: r?.stderr || '',
+    error: r?.error,
   };
 }
 
