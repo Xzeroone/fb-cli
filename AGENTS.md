@@ -6,7 +6,7 @@ You are setting up or using **fb**, a Facebook/Messenger CLI that drives the use
 
 ```bash
 # when published:
-curl -fsSL https://raw.githubusercontent.com/<OWNER>/fb-cli/main/scripts/get-fb.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Xzeroone/fb-cli/main/scripts/get-fb.sh | bash
 
 # local tree:
 FB_LOCAL_ROOT=/path/to/fb-cli bash /path/to/fb-cli/scripts/get-fb.sh

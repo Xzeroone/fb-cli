@@ -15,7 +15,7 @@ Not affiliated with Meta. Public / visible content only.
 When this repo is on GitHub:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<OWNER>/fb-cli/main/scripts/get-fb.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Xzeroone/fb-cli/main/scripts/get-fb.sh | bash
 ```
 
 Local / agent:

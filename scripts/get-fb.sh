@@ -5,7 +5,7 @@
 #   bash /path/to/fb-cli/scripts/get-fb.sh
 set -euo pipefail
 
-REPO_URL="${FB_REPO_URL:-https://github.com/xzero/fb-cli.git}"
+REPO_URL="${FB_REPO_URL:-https://github.com/Xzeroone/fb-cli.git}"
 BRANCH="${FB_BRANCH:-main}"
 INSTALL_DIR="${FB_INSTALL_DIR:-$HOME/.local/share/fb-cli}"
 BIN_DIR="${FB_BIN_DIR:-$HOME/bin}"
