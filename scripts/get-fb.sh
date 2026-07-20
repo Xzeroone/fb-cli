@@ -25,14 +25,29 @@ echo
 # --- node ---
 if ! command -v node >/dev/null 2>&1; then
   red "Node.js >= 20 is required."
-  yellow "Install Node, then re-run this script."
-  echo "  https://nodejs.org/  or:  sudo apt install nodejs npm"
+  if command -v apt-get >/dev/null 2>&1; then
+    yellow "On Debian/Ubuntu, this script can install Node 20 from NodeSource. Re-run with FB_AUTO_INSTALL_NODE=1"
+  fi
+  yellow "Or install Node manually: https://nodejs.org/"
   exit 1
 fi
 MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
 if [[ "$MAJOR" -lt 20 ]]; then
   red "Node $(node -v) is too old (need >= 20)"
-  exit 1
+  if [[ "${FB_AUTO_INSTALL_NODE:-0}" == "1" ]] && command -v apt-get >/dev/null 2>&1; then
+    yellow "FB_AUTO_INSTALL_NODE=1 — installing Node 20 from NodeSource"
+    apt-get install -y -qq curl ca-certificates gnupg >/dev/null 2>&1
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1
+    apt-get install -y -qq nodejs >/dev/null 2>&1
+    MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
+    if [[ "$MAJOR" -lt 20 ]]; then
+      red "Node 20 install from NodeSource failed."
+      exit 1
+    fi
+  else
+    yellow "Re-run with FB_AUTO_INSTALL_NODE=1 to install Node 20 automatically (Debian/Ubuntu)."
+    exit 1
+  fi
 fi
 
 # --- npm prefix for user-local global (no sudo) ---

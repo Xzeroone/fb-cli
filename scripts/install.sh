@@ -1,11 +1,24 @@
 #!/usr/bin/env bash
 # Install fb CLI + opencli facebook adapters + optional systemd units
+#
+# What this does:
+#   1. Verifies Node >= 20 and Chrome are present
+#   2. Installs @jackwener/opencli globally if missing
+#   3. Copies bin/fb and bin/fb-headless into $BIN_DIR (default ~/bin/)
+#   4. Copies adapters/facebook/* into ~/.opencli/clis/facebook/
+#   5. Optionally installs the fb-opencli.service systemd user unit
+#
+# After install, the human must:
+#   1. Install the OpenCLI Chrome extension (one click)
+#   2. Log into Facebook in Chrome
+#   3. Optionally: fb-headless start (for zero-GUI mode)
+#   4. Run: fb whoami
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 HOME_DIR="${HOME:-$(eval echo ~)}"
 BIN_DIR="${FB_BIN_DIR:-$HOME_DIR/bin}"
-OPENCLI_CLIS="${HOME_DIR}/.opencli/clis/facebook"
+OPENCLI_CLIS="$HOME_DIR/.opencli/clis/facebook"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME_DIR/.config}/systemd/user"
 STORE="${FB_STORE_DIR:-$HOME_DIR/.local/state/fb}"
 
@@ -38,16 +51,13 @@ find_opencli() {
 find_opencli_daemon_js() {
   local opencli
   opencli="$(find_opencli)" || return 1
-  # resolve symlink → package
   local real
   real="$(readlink -f "$opencli" 2>/dev/null || realpath "$opencli" 2>/dev/null || echo "$opencli")"
-  # typical: .../node_modules/@jackwener/opencli/dist/src/main.js
   local pkg
   pkg="$(cd "$(dirname "$real")/../.." 2>/dev/null && pwd)"
   if [[ -f "$pkg/dist/src/daemon.js" ]]; then
     echo "$pkg/dist/src/daemon.js"; return
   fi
-  # npm global layout
   local nm
   nm="$(npm root -g 2>/dev/null || true)"
   if [[ -n "$nm" && -f "$nm/@jackwener/opencli/dist/src/daemon.js" ]]; then
@@ -62,13 +72,34 @@ echo "=========================================="
 echo
 
 # --- prerequisites ---
+need_cmd curl
 need_cmd node
-need_cmd npm
 NODE_BIN="$(command -v node)"
 NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
 if [[ "$NODE_MAJOR" -lt 20 ]]; then
-  red "Node.js >= 20 required (found $(node -v))"
-  exit 1
+  yellow "Node $NODE_MAJOR found, but >= 20 is required."
+  yellow "Trying NodeSource (apt) to get Node 20…"
+  if command -v apt-get >/dev/null 2>&1; then
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1 || {
+      red "Could not install Node 20 from NodeSource."
+      yellow "Install Node >= 20 manually: https://nodejs.org/"
+      exit 1
+    }
+    apt-get install -y -qq nodejs >/dev/null 2>&1 || {
+      red "Node 20 install failed. Try installing manually."
+      exit 1
+    }
+    NODE_BIN="$(command -v node)"
+    NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
+  elif command -v brew >/dev/null 2>&1; then
+    yellow "Install via Homebrew:"
+    yellow "  brew install node@20"
+    exit 1
+  else
+    red "Node >= 20 required, but only $NODE_MAJOR found."
+    yellow "Install Node >= 20: https://nodejs.org/"
+    exit 1
+  fi
 fi
 
 if ! find_opencli >/dev/null; then
@@ -88,10 +119,7 @@ info "daemon:  $DAEMON_JS"
 # --- bins ---
 mkdir -p "$BIN_DIR" "$STORE"/{tmp,keep,cache} "$OPENCLI_CLIS" "$UNIT_DIR"
 install -m 755 "$ROOT/bin/fb" "$BIN_DIR/fb"
-install -m 755 "$ROOT/bin/fb-service" "$BIN_DIR/fb-service"
-install -m 755 "$ROOT/bin/fb-chrome-lean" "$BIN_DIR/fb-chrome-lean"
-# portable paths in fb-service
-sed -i "s|/home/xzero/bin/fb|$BIN_DIR/fb|g" "$BIN_DIR/fb-service" 2>/dev/null || true
+install -m 755 "$ROOT/bin/fb-headless" "$BIN_DIR/fb-headless"
 info "installed binaries → $BIN_DIR"
 
 # --- adapters ---
@@ -104,45 +132,42 @@ if ! echo ":$PATH:" | grep -q ":$BIN_DIR:"; then
   echo "  export PATH=\"$BIN_DIR:\$PATH\""
 fi
 
-# --- systemd (optional) ---
+# --- systemd (optional, just the opencli daemon) ---
 if command -v systemctl >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then
-  for u in fb-opencli.service fb-hide.service fb-hide.timer fb-chrome-lean.service; do
-    src="$ROOT/systemd/$u"
-    dst="$UNIT_DIR/$u"
-    sed \
-      -e "s|__NODE__|$NODE_BIN|g" \
-      -e "s|__OPENCLI_DAEMON__|$DAEMON_JS|g" \
-      -e "s|%h|$HOME_DIR|g" \
-      "$src" > "$dst"
-  done
-  # restore %h where systemd supports it for portability on this machine we expanded
-  # (user units often prefer absolute paths after install)
+  src="$ROOT/systemd/fb-opencli.service"
+  dst="$UNIT_DIR/fb-opencli.service"
+  sed \
+    -e "s|__NODE__|$NODE_BIN|g" \
+    -e "s|__OPENCLI_DAEMON__|$DAEMON_JS|g" \
+    -e "s|%h|$HOME_DIR|g" \
+    "$src" > "$dst"
   systemctl --user daemon-reload
-  info "systemd user units written → $UNIT_DIR"
-  yellow "Enable lightweight stack:"
-  echo "  systemctl --user enable --now fb-opencli.service fb-hide.timer"
-  echo "  # optional always-on Chrome attach:"
-  echo "  systemctl --user enable --now fb-chrome-lean.service"
-  echo "  # survive logout:"
-  echo "  loginctl enable-linger \"\$USER\""
+  info "systemd user unit written → $dst"
+  yellow "Optional: enable the opencli daemon as a user service"
+  echo "  systemctl --user enable --now fb-opencli.service"
+  echo "  loginctl enable-linger \"\$USER\"   # survive logout"
 else
-  yellow "systemd --user not available — skip services (fb still works when Chrome is open)"
+  yellow "systemd --user not available — skip unit (fb auto-starts the daemon on first call)"
 fi
 
 echo
 green "Install complete."
 echo
-echo "========== Auth setup (everyone needs this once) =========="
-echo "1. Install OpenCLI Chrome extension:"
+echo "========== One-time setup (everyone needs this) =========="
+echo "1. Install the OpenCLI Chrome extension:"
 echo "   https://chromewebstore.google.com/detail/opencli/ildkmabpimmkaediidaifkhjpohdnifk"
 echo "2. Open Chrome and log into facebook.com (normal login / 2FA)."
-echo "3. Check bridge:"
+echo "3. Verify the bridge:"
 echo "   opencli doctor"
-echo "4. Check Facebook session:"
+echo "4. Verify the Facebook session:"
 echo "   fb whoami"
-echo "   # or: fb auth   (opens login if needed)"
-echo "5. Optional services:"
-echo "   fb-service install   # or systemctl commands above"
 echo
-echo "If doctor fails: keep Chrome open with the extension enabled."
-echo "============================================================"
+echo "========== Optional: zero-GUI headless mode =========="
+echo "If you don't want a Chrome window open while using fb:"
+echo "   fb-headless start    # launches a dedicated headless Chrome on :9223"
+echo "   fb-headless status   # check it"
+echo "   fb-headless stop     # kill it"
+echo "   fb-headless reset    # wipe + re-copy the headless profile"
+echo
+echo "Then any fb command will use the headless Chrome automatically."
+echo "============================================================="

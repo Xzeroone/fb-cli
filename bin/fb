@@ -1,967 +1,885 @@
 #!/usr/bin/env node
 /**
- * fb — Facebook/Messenger CLI (bird / wacli style UX on top of opencli)
+ * fb 0.7.0 — Facebook/Messenger CLI, wacli/bird-shaped, lightweight.
  *
- * Requires: opencli + Chrome OpenCLI extension (opencli doctor)
- * Store:    ~/.local/state/fb/
+ * v0.7.0 changes:
+ *   - Default transport is the opencli-managed Chrome on :9222 (or whichever
+ *     CDP port is reachable). No fb-managed Chrome, no wmctrl/xdotool/hide
+ *     dance, no systemd timer. The user can close the Chrome window;
+ *     opencli keeps the browser process alive in the background.
+ *   - Optional: `fb-headless start` launches a dedicated headless Chrome on
+ *     a separate profile (port 9223) for users who want zero visible UI.
+ *     Set FB_CHROME_ENDPOINT=http://127.0.0.1:9223 to opt in.
+ *   - All other v0.6.0 surface preserved: FTS5 store, accounts, completion,
+ *     --json/--events/--read-only/--account/--store/--timeout/--no-color,
+ *     per-subcommand help, lock file, deterministic exit codes.
+ *
+ * Scope is unchanged: this is a shell over opencli + a local SQLite store.
  */
+
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createRequire } from 'node:module';
+import readline from 'node:readline';
 
-const VERSION = '0.5.0';
-const OPENCLI_EXT_URL =
-  process.env.FB_OPENCLI_EXT_URL ||
-  'https://chromewebstore.google.com/detail/opencli/ildkmabpimmkaediidaifkhjpohdnifk';
-const FACEBOOK_LOGIN_URL = 'https://www.facebook.com/login';
-const STORE_DIR = process.env.FB_STORE_DIR || path.join(os.homedir(), '.local/state/fb');
+const VERSION = '0.7.0';
+const PROGRAM = 'fb';
+
+const XDG_STATE = process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local/state');
+const XDG_CONFIG = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
+const DEFAULT_STORE = path.join(XDG_STATE, 'fb');
+const STORE_DIR = process.env.FB_STORE_DIR || DEFAULT_STORE;
 const DB_PATH = path.join(STORE_DIR, 'fb.db');
+const LOCK_PATH = path.join(STORE_DIR, 'fb.lock');
 const DAEMON_STATE = path.join(STORE_DIR, 'daemon.json');
-// Default: invisible backend (opencli background windows). Override with --window foreground.
-const DEFAULT_WINDOW = process.env.FB_WINDOW || process.env.OPENCLI_WINDOW || 'background';
+const CACHE_DIR = path.join(STORE_DIR, 'cache');
+const TMP_DIR = path.join(STORE_DIR, 'tmp');
+const KEEP_DIR = path.join(STORE_DIR, 'keep');
+const CONFIG_PATH = process.env.FB_CONFIG || path.join(XDG_CONFIG, 'fb', 'config.json5');
 
-function ensureStore() {
-  fs.mkdirSync(STORE_DIR, { recursive: true });
-  fs.mkdirSync(path.join(STORE_DIR, 'cache'), { recursive: true });
-  const schema = `
-CREATE TABLE IF NOT EXISTS meta (
-  key TEXT PRIMARY KEY,
-  value TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS notifications (
-  notif_id TEXT PRIMARY KEY,
-  unread INTEGER,
-  text TEXT,
-  time TEXT,
-  url TEXT,
-  notif_type TEXT,
-  synced_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS groups (
-  url TEXT PRIMARY KEY,
-  name TEXT,
-  last_post TEXT,
-  synced_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS chats (
-  thread_id TEXT PRIMARY KEY,
-  name TEXT,
-  snippet TEXT,
-  time TEXT,
-  unread INTEGER,
-  url TEXT,
-  synced_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS messages (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  thread_id TEXT NOT NULL,
-  from_me INTEGER,
-  sender TEXT,
-  text TEXT,
-  time TEXT,
-  synced_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id);
-`;
-  runSql(schema);
+const EXIT = { OK: 0, USAGE: 2, NOT_AUTHED: 3, NOT_FOUND: 4, READ_ONLY: 5, LOCKED: 6, OPENCLI_FAIL: 7, INTERNAL: 1 };
+
+const nowIso = () => new Date().toISOString();
+const sleepMs = (ms) => spawnSync('sleep', [String(ms / 1000)]);
+const which = (bin) => {
+  const r = spawnSync('which', [bin], { encoding: 'utf8' });
+  return r.status === 0 ? r.stdout.trim() : null;
+};
+const fileExists = (p) => { try { fs.accessSync(p); return true; } catch { return false; } };
+const die = (msg, code = EXIT.USAGE, { json } = {}) => {
+  if (json) console.log(JSON.stringify({ ok: false, error: msg, exit: code, version: VERSION }, null, 2));
+  else console.error(`fb: ${msg}`);
+  process.exit(code);
+};
+
+// ─── config (JSON5-lite) ────────────────────────────────────────────────────
+function parseJson5Lite(src) {
+  let out = ''; let i = 0; let inStr = null;
+  while (i < src.length) {
+    const c = src[i]; const n = src[i + 1];
+    if (inStr) {
+      out += c;
+      if (c === '\\' && i + 1 < src.length) { out += n; i += 2; continue; }
+      if (c === inStr) inStr = null;
+      i += 1; continue;
+    }
+    if (c === '"' || c === "'") { inStr = c; out += c; i += 1; continue; }
+    if (c === '/' && n === '/') { while (i < src.length && src[i] !== '\n') i += 1; continue; }
+    if (c === '/' && n === '*') { i += 2; while (i < src.length && !(src[i] === '*' && src[i+1] === '/')) i += 1; i += 2; continue; }
+    out += c; i += 1;
+  }
+  out = out.replace(/([{,]\s*)([A-Za-z_$][A-Za-z0-9_$]*)(\s*:)/g, '$1"$2"$3');
+  out = out.replace(/,(\s*[}\]])/g, '$1');
+  return JSON.parse(out);
+}
+function loadConfig() {
+  try { return parseJson5Lite(fs.readFileSync(CONFIG_PATH, 'utf8')); } catch { return {}; }
+}
+const CFG = loadConfig();
+function cfgStore() { return process.env.FB_STORE_DIR || CFG.store || DEFAULT_STORE; }
+function cfgAccount() { return process.env.FB_ACCOUNT || CFG.account || 'default'; }
+
+// ─── global flag parsing ────────────────────────────────────────────────────
+function parseArgs(argv) {
+  const out = {
+    json: false, events: false, readOnly: false, plain: false, full: false,
+    noColor: !!CFG.noColor || !!process.env.NO_COLOR || !!process.env.FB_NO_COLOR,
+    account: null, store: null, timeout: null, limit: null, window: null,
+    help: false, version: false, rest: [],
+  };
+  const a = [...argv];
+  const eat = () => a.shift();
+  while (a.length) {
+    const tok = eat();
+    switch (tok) {
+      case '--json': case '-j': out.json = true; break;
+      case '--events': out.events = true; break;
+      case '--read-only': out.readOnly = true; break;
+      case '--plain': out.plain = true; break;
+      case '--full': out.full = true; break;
+      case '--no-color': out.noColor = true; break;
+      case '--help': case '-h': out.help = true; break;
+      case '--version': case '-V': out.version = true; break;
+      case '--account': out.account = eat() ?? null; break;
+      case '--store': out.store = eat() ?? null; if (out.store) process.env.FB_STORE_DIR = out.store; break;
+      case '--timeout': out.timeout = eat() ?? null; break;
+      case '--limit': case '-n': out.limit = eat() ?? null; break;
+      case '--window': out.window = eat() ?? null; break;
+      default: out.rest.push(tok);
+    }
+  }
+  if (out.readOnly || process.env.FB_READONLY === '1' || CFG.readOnly) out.readOnly = true;
+  if (out.account == null) out.account = cfgAccount();
+  return out;
 }
 
-function runSql(sql, params = []) {
-  ensureDirOnly();
-  // Use sqlite3 CLI for zero npm deps
-  if (params.length) {
-    // parameterize poorly via JSON for simple cases - prefer direct for our writes
+// ─── opencli daemon + Chrome CDP discovery ─────────────────────────────────
+// opencli has two services:
+//   1. Daemon (port 19825) — Node bridge that the CLI calls
+//   2. Chrome (port 9222 by default, 9223 for headless) — actual browser
+// The Browser Bridge extension lives inside Chrome and connects to the daemon.
+// For the headless path, we manage a separate Chrome on :9223 with its own
+// profile (fb-headless), so it can run alongside the user's normal Chrome
+// without SingletonLock conflicts.
+const HEADLESS_CDP = 'http://127.0.0.1:9223';
+const VISIBLE_CDP = 'http://127.0.0.1:9222';
+const DAEMON_URL_DEFAULT = 'http://127.0.0.1:19825';
+
+function cdpProbe(url) {
+  try {
+    const r = spawnSync('curl', ['-s', '--max-time', '1', '-o', '/dev/null', '-w', '%{http_code}', `${url}/json/version`], { encoding: 'utf8' });
+    return r.stdout === '200';
+  } catch { return false; }
+}
+function chromeCheck() {
+  // User can override with FB_CHROME_ENDPOINT
+  if (process.env.FB_CHROME_ENDPOINT) {
+    const url = process.env.FB_CHROME_ENDPOINT;
+    if (cdpProbe(url)) return { ok: true, url, headless: url.includes(':9223') };
+    return { ok: false, reason: `FB_CHROME_ENDPOINT=${url} not reachable` };
   }
-  const r = spawnSync('sqlite3', [DB_PATH], {
-    input: sql,
-    encoding: 'utf8',
-    maxBuffer: 20 * 1024 * 1024,
-  });
+  // Prefer the headless Chrome on :9223 (it's the default path now)
+  if (cdpProbe(HEADLESS_CDP)) return { ok: true, url: HEADLESS_CDP, headless: true };
+  // Fall back to the user's visible Chrome on :9222
+  if (cdpProbe(VISIBLE_CDP)) return { ok: true, url: VISIBLE_CDP, headless: false };
+  return { ok: false, reason: 'no Chrome CDP reachable on :9222 or :9223 (run: fb-headless start)' };
+}
+function chromeStr() {
+  const r = chromeCheck();
+  if (r.ok) return `${r.url} (${r.headless ? 'headless' : 'visible'})`;
+  return `NOT FOUND — ${r.reason}`;
+}
+
+// Ensure the headless Chrome is running. Called by the opencli wrapper and by
+// `fb` commands that need a browser. Returns the CDP URL to use.
+function ensureChrome({ autoStart = true } = {}) {
+  const c = chromeCheck();
+  if (c.ok) return c;
+  if (!autoStart) return null;
+  if (process.env.FB_NO_AUTOSTART) return null;
+  // Try to start the headless Chrome
+  if (!which('fb-headless')) return null;
+  emitEvent('chrome.autostart', {});
+  const r = spawnSync('fb-headless', ['start'], { encoding: 'utf8', timeout: 60000 });
+  if (r.status !== 0) return null;
+  // Re-probe
+  const c2 = chromeCheck();
+  return c2.ok ? c2 : null;
+}
+
+function discoverOpencliDaemon() {
+  const ep = process.env.OPENCLI_DAEMON_URL || DAEMON_URL_DEFAULT;
+  try {
+    const r = spawnSync('curl', ['-s', '--max-time', '1', '-H', 'X-OpenCLI: 1', `${ep}/status`], { encoding: 'utf8' });
+    if (r.status === 0 && r.stdout && r.stdout.includes('"ok":true')) return ep;
+  } catch { /* */ }
+  return null;
+}
+function daemonHealth() {
+  const ep = discoverOpencliDaemon();
+  if (!ep) return null;
+  try {
+    const r = spawnSync('curl', ['-s', '--max-time', '2', '-H', 'X-OpenCLI: 1', `${ep}/status`], { encoding: 'utf8' });
+    if (r.status !== 0 || !r.stdout) return null;
+    return JSON.parse(r.stdout);
+  } catch { return null; }
+}
+function ensureOpencliDaemon({ autoStart = true } = {}) {
+  let ep = discoverOpencliDaemon();
+  if (ep) return ep;
+  if (!autoStart) return null;
+  if (process.env.FB_NO_AUTOSTART) return null;
+  // Try to start the opencli daemon
+  emitEvent('daemon.autostart', {});
+  // opencli has no 'daemon start' — 'restart' brings it up if not running
+  spawnSync(OPENCLI, ['daemon', 'restart'], { encoding: 'utf8', timeout: 30000 });
+  sleepMs(1500);
+  return discoverOpencliDaemon();
+}
+
+// Composite readiness: both daemon + chrome + extension connected
+function bridgeCheck({ autoStart = true } = {}) {
+  // 1. Ensure opencli daemon
+  const dep = ensureOpencliDaemon({ autoStart });
+  if (!dep) return { ok: false, reason: 'opencli daemon not reachable on 19825 (tried to start)', url: null };
+  // 2. Ensure Chrome
+  const cc = ensureChrome({ autoStart });
+  if (!cc) return { ok: false, reason: 'no Chrome reachable (headless or visible) — tried fb-headless start', url: dep };
+  // 3. Check extension connection
+  const h = daemonHealth();
+  if (!h) return { ok: false, reason: 'opencli daemon responded but status unparseable', url: dep, chrome: cc };
+  if (!h.extensionConnected) {
+    return { ok: false, reason: 'Browser Bridge extension not connected to opencli daemon (open Chrome with the extension loaded)', url: dep, chrome: cc, health: h };
+  }
+  return { ok: true, url: dep, chrome: cc, health: h };
+}
+function bridgeStr() {
+  const r = bridgeCheck();
+  if (r.ok) return `daemon=${r.url}  chrome=${r.chrome.url} (${r.chrome.headless ? 'headless' : 'visible'})`;
+  let s = `NOT READY — ${r.reason}`;
+  if (r.url) s += `  (daemon at ${r.url})`;
+  if (r.chrome) s += `  (chrome at ${r.chrome.url})`;
+  return s;
+}
+
+// Legacy alias: daemonCheck → bridgeCheck so existing call sites keep working
+function daemonCheck() { return bridgeCheck({ autoStart: false }); }
+function daemonStr() { return bridgeStr(); }
+
+// ─── NDJSON events ──────────────────────────────────────────────────────────
+let _eventsOn = false;
+function emitEvent(type, data = {}) {
+  if (!_eventsOn) return;
+  const evt = { t: nowIso(), event: type, ...data };
+  try { process.stderr.write(JSON.stringify(evt) + '\n'); } catch { /* */ }
+}
+
+// ─── opencli wrapper ────────────────────────────────────────────────────────
+function whichOpencli() {
+  const cands = [
+    process.env.OPENCLI_BIN,
+    path.join(os.homedir(), '.npm-global/bin/opencli'),
+    '/usr/local/bin/opencli',
+    'opencli',
+  ].filter(Boolean);
+  for (const c of cands) {
+    if (c === 'opencli') return c;
+    try { fs.accessSync(c, fs.constants.X_OK); return c; } catch { /* next */ }
+  }
+  return 'opencli';
+}
+const OPENCLI = whichOpencli();
+
+function opencli(args, opts = {}) {
+  const { json = true, timeout = 180000, windowMode } = opts;
+  const cmdArgs = [...args];
+  if (json && !cmdArgs.includes('-f') && !cmdArgs.includes('--format')) cmdArgs.push('-f', 'json');
+  const hasWindow = cmdArgs.includes('--window');
+  const mode = windowMode || 'background';
+  const isBrowserCmd = cmdArgs[0] === 'facebook' || cmdArgs[0] === 'browser';
+  if (!hasWindow && (mode === 'background' || mode === 'foreground') && isBrowserCmd) {
+    cmdArgs.push('--window', mode);
+  }
+  if (isBrowserCmd && !cmdArgs.includes('--site-session')) cmdArgs.push('--site-session', 'persistent');
+  if (isBrowserCmd && !cmdArgs.includes('--keep-tab') && mode === 'background') {
+    cmdArgs.push('--keep-tab', 'false');
+  }
+  // Make sure the full bridge is ready (auto-starts daemon + headless Chrome if needed).
+  // Then point opencli at the Chrome CDP endpoint (NOT the daemon URL — those are different).
+  const bridge = bridgeCheck({ autoStart: true });
+  const env = { ...process.env };
+  if (bridge.ok && bridge.chrome) {
+    env.OPENCLI_CDP_ENDPOINT = bridge.chrome.url;
+  } else if (!bridge.ok) {
+    emitEvent('opencli.skip', { reason: bridge.reason });
+  }
+  env.OPENCLI_WINDOW = mode;
+
+  emitEvent('opencli.start', { sub: `${cmdArgs[0]}:${cmdArgs[1] || ''}`, mode, timeout, cdp: env.OPENCLI_CDP_ENDPOINT || 'none' });
+  const r = spawnSync(OPENCLI, cmdArgs, { encoding: 'utf8', maxBuffer: 30 * 1024 * 1024, timeout, env });
+  const out = { status: r?.status ?? 1, stdout: r?.stdout || '', stderr: r?.stderr || '', error: r?.error };
+  emitEvent('opencli.end', { sub: `${cmdArgs[0]}:${cmdArgs[1] || ''}`, status: out.status, duration_ms: Date.now() - _t0 });
+  return out;
+}
+let _t0 = 0;
+
+// ─── sqlite (uses sqlite3 CLI) ───────────────────────────────────────────────
+function ensureStore() {
+  fs.mkdirSync(STORE_DIR, { recursive: true });
+  fs.mkdirSync(CACHE_DIR, { recursive: true });
+  fs.mkdirSync(TMP_DIR, { recursive: true });
+  fs.mkdirSync(KEEP_DIR, { recursive: true });
+  const schema = `
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS accounts (name TEXT PRIMARY KEY, user_id TEXT, display_name TEXT, profile_url TEXT, created_at TEXT NOT NULL, last_used_at TEXT);
+CREATE TABLE IF NOT EXISTS notifications (notif_id TEXT PRIMARY KEY, unread INTEGER, text TEXT, time TEXT, url TEXT, notif_type TEXT, account TEXT NOT NULL DEFAULT 'default', synced_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS groups (url TEXT PRIMARY KEY, name TEXT, last_post TEXT, account TEXT NOT NULL DEFAULT 'default', synced_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS chats (thread_id TEXT PRIMARY KEY, name TEXT, snippet TEXT, time TEXT, unread INTEGER, url TEXT, account TEXT NOT NULL DEFAULT 'default', synced_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, thread_id TEXT NOT NULL, from_me INTEGER, sender TEXT, text TEXT, time TEXT, account TEXT NOT NULL DEFAULT 'default', synced_at TEXT NOT NULL);
+`;
+  runSql(schema);
+  migrateAddColumn('notifications', 'account', "TEXT NOT NULL DEFAULT 'default'");
+  migrateAddColumn('groups', 'account', "TEXT NOT NULL DEFAULT 'default'");
+  migrateAddColumn('chats', 'account', "TEXT NOT NULL DEFAULT 'default'");
+  migrateAddColumn('messages', 'account', "TEXT NOT NULL DEFAULT 'default'");
+  runSql(`
+CREATE INDEX IF NOT EXISTS idx_notif_account_time ON notifications(account, time);
+CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id);
+CREATE INDEX IF NOT EXISTS idx_messages_account_time ON messages(account, time);
+CREATE INDEX IF NOT EXISTS idx_chats_account ON chats(account);
+CREATE INDEX IF NOT EXISTS idx_groups_account ON groups(account);
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(text, sender, thread_id UNINDEXED, account UNINDEXED, content='messages', content_rowid='id', tokenize='unicode61');
+CREATE VIRTUAL TABLE IF NOT EXISTS notifications_fts USING fts5(text, notif_type, account UNINDEXED, content='notifications', content_rowid='rowid', tokenize='unicode61');
+CREATE VIRTUAL TABLE IF NOT EXISTS groups_fts USING fts5(name, last_post, account UNINDEXED, content='groups', content_rowid='rowid', tokenize='unicode61');
+`);
+  rebuildFtsTriggers();
+}
+function migrateAddColumn(table, column, decl) {
+  try {
+    const cols = runSql(`PRAGMA table_info(${table});`);
+    const has = cols.split('\n').some((l) => l.split('|')[1] === column);
+    if (has) return false;
+    runSql(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl};`);
+    runSql(`UPDATE ${table} SET ${column} = 'default' WHERE ${column} IS NULL;`);
+    return true;
+  } catch { return false; }
+}
+function rebuildFtsTriggers() {
+  const drops = ['DROP TRIGGER IF EXISTS messages_ai;','DROP TRIGGER IF EXISTS messages_ad;','DROP TRIGGER IF EXISTS messages_au;','DROP TRIGGER IF EXISTS notif_ai;','DROP TRIGGER IF EXISTS notif_ad;','DROP TRIGGER IF EXISTS groups_ai;','DROP TRIGGER IF EXISTS groups_ad;'];
+  const creates = [
+    `CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN INSERT INTO messages_fts(rowid, text, sender, thread_id, account) VALUES (new.id, COALESCE(new.text,''), COALESCE(new.sender,''), new.thread_id, new.account); END;`,
+    `CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN INSERT INTO messages_fts(messages_fts, rowid, text, sender, thread_id, account) VALUES('delete', old.id, COALESCE(old.text,''), COALESCE(old.sender,''), old.thread_id, old.account); END;`,
+    `CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN INSERT INTO messages_fts(messages_fts, rowid, text, sender, thread_id, account) VALUES('delete', old.id, COALESCE(old.text,''), COALESCE(old.sender,''), old.thread_id, old.account); INSERT INTO messages_fts(rowid, text, sender, thread_id, account) VALUES (new.id, COALESCE(new.text,''), COALESCE(new.sender,''), new.thread_id, new.account); END;`,
+    `CREATE TRIGGER IF NOT EXISTS notif_ai AFTER INSERT ON notifications BEGIN INSERT INTO notifications_fts(rowid, text, notif_type, account) VALUES (new.rowid, COALESCE(new.text,''), COALESCE(new.notif_type,''), new.account); END;`,
+    `CREATE TRIGGER IF NOT EXISTS notif_ad AFTER DELETE ON notifications BEGIN INSERT INTO notifications_fts(notifications_fts, rowid, text, notif_type, account) VALUES('delete', old.rowid, COALESCE(old.text,''), COALESCE(old.notif_type,''), old.account); END;`,
+    `CREATE TRIGGER IF NOT EXISTS groups_ai AFTER INSERT ON groups BEGIN INSERT INTO groups_fts(rowid, name, last_post, account) VALUES (new.rowid, COALESCE(new.name,''), COALESCE(new.last_post,''), new.account); END;`,
+    `CREATE TRIGGER IF NOT EXISTS groups_ad AFTER DELETE ON groups BEGIN INSERT INTO groups_fts(groups_fts, rowid, name, last_post, account) VALUES('delete', old.rowid, COALESCE(old.name,''), COALESCE(old.last_post,''), old.account); END;`,
+  ];
+  runSql(drops.join('\n') + '\n' + creates.join('\n'));
+}
+function ensureStoreOnly() { fs.mkdirSync(STORE_DIR, { recursive: true }); }
+function runSql(sql, params = []) {
+  ensureStoreOnly();
+  if (params.length) {
+    const quoted = params.map((p) => {
+      if (p === null || p === undefined) return 'NULL';
+      if (typeof p === 'number' && Number.isFinite(p)) return String(p);
+      return `'${String(p).replace(/'/g, "''")}'`;
+    });
+    let i = 0;
+    sql = sql.replace(/\?/g, () => quoted[i++] ?? 'NULL');
+  }
+  const r = spawnSync('sqlite3', [DB_PATH], { input: sql, encoding: 'utf8', maxBuffer: 20 * 1024 * 1024 });
   if (r.status !== 0) {
     const err = (r.stderr || r.stdout || 'sqlite3 failed').trim();
     throw new Error(err || `sqlite3 exit ${r.status}`);
   }
   return r.stdout;
 }
+const sqlEscape = (s) => String(s ?? '').replace(/'/g, "''");
+const setMeta = (k, v) => {
+  const ts = nowIso();
+  runSql(`INSERT INTO meta(key,value,updated_at) VALUES('${sqlEscape(k)}','${sqlEscape(v)}','${ts}') ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at;`);
+};
+const getMeta = (k) => {
+  const out = runSql(`SELECT value FROM meta WHERE key='${sqlEscape(k)}' LIMIT 1;`).trim();
+  return out || null;
+};
 
-function ensureDirOnly() {
-  fs.mkdirSync(STORE_DIR, { recursive: true });
-}
-
-function sqlEscape(s) {
-  return String(s ?? '').replace(/'/g, "''");
-}
-
-function nowIso() {
-  return new Date().toISOString();
-}
-
-function whichOpencli() {
-  const candidates = [
-    process.env.OPENCLI_BIN,
-    path.join(os.homedir(), '.npm-global/bin/opencli'),
-    '/usr/local/bin/opencli',
-    'opencli',
-  ].filter(Boolean);
-  for (const c of candidates) {
-    if (c === 'opencli') return c;
+// ─── store lock ─────────────────────────────────────────────────────────────
+function acquireLock({ wait = 0 } = {}) {
+  ensureStoreOnly();
+  if (fs.existsSync(LOCK_PATH)) {
+    let owner = null;
+    try { owner = JSON.parse(fs.readFileSync(LOCK_PATH, 'utf8')); } catch { /* */ }
+    if (wait > 0) {
+      const start = Date.now();
+      while (Date.now() - start < wait * 1000) {
+        if (!fs.existsSync(LOCK_PATH)) break;
+        sleepMs(200);
+      }
+    }
+    if (fs.existsSync(LOCK_PATH)) return { ok: false, owner, path: LOCK_PATH };
+  }
+  const payload = { pid: process.pid, user: os.userInfo().username, started_at: nowIso(), cmd: process.argv.slice(2).join(' ').slice(0, 200) };
+  fs.writeFileSync(LOCK_PATH, JSON.stringify(payload, null, 2));
+  const release = () => {
     try {
-      fs.accessSync(c, fs.constants.X_OK);
-      return c;
-    } catch {
-      /* next */
-    }
-  }
-  return 'opencli';
-}
-
-const OPENCLI = whichOpencli();
-
-function parseGlobalArgs(argv) {
-  const out = {
-    json: false,
-    plain: false,
-    limit: null,
-    window: null,
-    help: false,
-    version: false,
-    rest: [],
+      const cur = JSON.parse(fs.readFileSync(LOCK_PATH, 'utf8'));
+      if (cur.pid === process.pid) fs.unlinkSync(LOCK_PATH);
+    } catch { /* */ }
   };
-  const args = [...argv];
-  // Allow global flags anywhere (before or after the subcommand)
-  while (args.length) {
-    const a = args.shift();
-    if (a === '--json' || a === '-j') out.json = true;
-    else if (a === '--plain') out.plain = true;
-    else if (a === '--help' || a === '-h') out.help = true;
-    else if (a === '--version' || a === '-V') out.version = true;
-    else if (a === '--limit' || a === '-n') out.limit = args.shift();
-    else if (a === '--window') out.window = args.shift();
-    else if (a === '--store') process.env.FB_STORE_DIR = args.shift();
-    else out.rest.push(a);
-  }
-  return out;
+  process.on('exit', release);
+  process.on('SIGINT', () => { release(); process.exit(130); });
+  process.on('SIGTERM', () => { release(); process.exit(143); });
+  return { ok: true, owner: payload };
+}
+function readLock() {
+  if (!fs.existsSync(LOCK_PATH)) return null;
+  try { return JSON.parse(fs.readFileSync(LOCK_PATH, 'utf8')); } catch { return null; }
 }
 
-function listChromeWindowIds() {
-  const list = spawnSync('wmctrl', ['-lx'], { encoding: 'utf8' });
-  if (list.status !== 0 || !list.stdout) return [];
-  // wmctrl -lx: id desktop class host title
-  return list.stdout
-    .split('\n')
-    .filter((l) => /google-chrome|chromium|Google-chrome|Chromium/i.test(l))
-    .map((l) => l.split(/\s+/)[0])
-    .filter(Boolean);
+// ─── read-only guard ────────────────────────────────────────────────────────
+let _readOnlyActive = false;
+let _jsonActive = false;
+function rejectIfReadOnly(action) {
+  if (_readOnlyActive) die(`refusing to ${action}: read-only mode (set FB_READONLY=0 or drop --read-only)`, EXIT.READ_ONLY, { json: _jsonActive });
 }
 
-function hideWindowIds(ids) {
-  let n = 0;
-  for (const id of ids) {
-    spawnSync('wmctrl', ['-i', '-r', id, '-b', 'add,hidden,below'], { encoding: 'utf8' });
-    spawnSync('wmctrl', ['-i', '-r', id, '-e', '0,-32000,-32000,100,100'], { encoding: 'utf8' });
-    spawnSync('xdotool', ['windowminimize', id], { encoding: 'utf8' });
-    n += 1;
-  }
-  return n;
-}
-
-/** Close windows (used for opencli automation popups after a command). */
-function closeWindowIds(ids) {
-  let n = 0;
-  for (const id of ids) {
-    // wmctrl -c = close window gracefully
-    spawnSync('wmctrl', ['-i', '-c', id], { encoding: 'utf8' });
-    n += 1;
-  }
-  return n;
-}
-
-function hideChromeWindows() {
-  try {
-    const ids = listChromeWindowIds();
-    if (!ids.length) return { ok: true, windows: 0 };
-    const n = hideWindowIds(ids);
-    return { ok: true, windows: n };
-  } catch (e) {
-    return { ok: false, reason: String(e.message || e) };
+// ─── output helpers ─────────────────────────────────────────────────────────
+function tryParseJson(text) {
+  const t = (text || '').trim();
+  if (!t) return null;
+  try { return JSON.parse(t); } catch {
+    const sObj = t.indexOf('{'), sArr = t.indexOf('[');
+    let s = -1;
+    if (sObj >= 0 && sArr >= 0) s = Math.min(sObj, sArr); else s = Math.max(sObj, sArr);
+    if (s < 0) return null;
+    try { return JSON.parse(t.slice(s)); } catch { return null; }
   }
 }
-
-/**
- * Close only windows that appeared during a command (opencli "owned" automation windows).
- * Never touches windows that already existed before the command.
- */
-function closeNewChromeWindows(beforeIds) {
-  try {
-    const after = listChromeWindowIds();
-    const before = new Set(beforeIds || []);
-    const created = after.filter((id) => !before.has(id));
-    if (!created.length) return { ok: true, windows: 0, created: [] };
-    // small delay so opencli can finish tab teardown
-    spawnSync('sleep', ['0.25']);
-    const n = closeWindowIds(created);
-    // if close failed / raced, force hide leftovers
-    spawnSync('sleep', ['0.2']);
-    const still = listChromeWindowIds().filter((id) => created.includes(id));
-    if (still.length) hideWindowIds(still);
-    return { ok: true, windows: n, created };
-  } catch (e) {
-    return { ok: false, reason: String(e.message || e) };
+function asRows(parsed) {
+  if (parsed == null) return [];
+  if (Array.isArray(parsed)) return parsed;
+  if (typeof parsed === 'object') {
+    if (Array.isArray(parsed.data)) return parsed.data;
+    if (Array.isArray(parsed.results)) return parsed.results;
+    return [parsed];
   }
+  return [];
 }
-
-/** @deprecated name kept for callers — now closes new windows */
-function hideNewChromeWindows(beforeIds) {
-  return closeNewChromeWindows(beforeIds);
+function stamp(payload, kind) {
+  if (Array.isArray(payload)) return { version: VERSION, program: PROGRAM, account: _account, kind, count: payload.length, data: payload };
+  return { version: VERSION, program: PROGRAM, account: _account, kind, ...payload };
 }
-
-/**
- * Live suppressor: while opencli runs, immediately minimize/park NEW Chrome windows
- * so automation feels background (spawnSync blocks Node, so use a side process).
- */
-function startLiveWindowSuppressor(beforeIds) {
-  const before = (beforeIds || []).join(' ');
-  const script = `
-BEFORE=" ${before} "
-while true; do
-  wmctrl -lx 2>/dev/null | awk 'BEGIN{IGNORECASE=1} /google-chrome|chromium|Google-chrome/{print $1}' | while read -r id; do
-    [ -z "$id" ] && continue
-    case " $BEFORE " in
-      *" $id "*) continue ;;
-    esac
-    wmctrl -i -r "$id" -b add,hidden,below 2>/dev/null || true
-    wmctrl -i -r "$id" -b add,shaded 2>/dev/null || true
-    wmctrl -i -r "$id" -e '0,-32000,-32000,80,80' 2>/dev/null || true
-    xdotool windowminimize "$id" 2>/dev/null || true
-  done
-  sleep 0.08
-done
-`;
-  return spawn('bash', ['-c', script], { stdio: 'ignore', detached: false });
-}
-
-function stopLiveWindowSuppressor(child) {
-  if (!child?.pid) return;
-  try {
-    process.kill(child.pid, 'SIGTERM');
-  } catch {
-    /* gone */
+function emit(rows, opts = {}) {
+  const { json, plain, noColor, full, kind = 'result' } = opts;
+  if (json) {
+    const payload = Array.isArray(rows)
+      ? (rows.length === 1 && !Array.isArray(rows[0]) ? stamp(rows[0], kind) : stamp(rows, kind))
+      : stamp(rows, kind);
+    console.log(JSON.stringify(payload, null, 2));
+    return;
   }
-  try {
-    child.kill('SIGKILL');
-  } catch {
-    /* ignore */
-  }
-}
-
-function opencli(args, { json = true, timeout = 180000, windowMode, hidePopups = true } = {}) {
-  const cmdArgs = [...args];
-  if (json && !cmdArgs.includes('-f') && !cmdArgs.includes('--format')) {
-    cmdArgs.push('-f', 'json');
-  }
-  const hasWindow = cmdArgs.includes('--window');
-  const mode = windowMode || DEFAULT_WINDOW;
-  const isBrowserCmd = cmdArgs[0] === 'facebook' || cmdArgs[0] === 'browser';
-  if (!hasWindow && (mode === 'background' || mode === 'foreground') && isBrowserCmd) {
-    cmdArgs.push('--window', mode);
-  }
-  if (isBrowserCmd && !cmdArgs.includes('--site-session')) {
-    cmdArgs.push('--site-session', 'persistent');
-  }
-  if (isBrowserCmd && !cmdArgs.includes('--keep-tab') && mode === 'background') {
-    cmdArgs.push('--keep-tab', 'false');
-  }
-
-  const env = {
-    ...process.env,
-    OPENCLI_WINDOW: mode,
-  };
-
-  const quiet = hidePopups && mode === 'background' && isBrowserCmd;
-  const beforeWins = quiet ? listChromeWindowIds() : [];
-  let suppressor = null;
-  if (quiet) suppressor = startLiveWindowSuppressor(beforeWins);
-
-  let r;
-  try {
-    r = spawnSync(OPENCLI, cmdArgs, {
-      encoding: 'utf8',
-      maxBuffer: 30 * 1024 * 1024,
-      timeout,
-      env,
-    });
-  } finally {
-    if (suppressor) stopLiveWindowSuppressor(suppressor);
-    if (quiet) {
-      // finished → close automation windows completely
-      closeNewChromeWindows(beforeWins);
-      spawnSync('sleep', ['0.25']);
-      closeNewChromeWindows(beforeWins);
+  if (plain) {
+    for (const row of rows) {
+      if (row && typeof row === 'object') console.log(Object.values(row).join('\t'));
+      else console.log(row);
     }
+    return;
   }
-  return {
-    status: r?.status ?? 1,
-    stdout: r?.stdout || '',
-    stderr: r?.stderr || '',
-    error: r?.error,
-  };
+  printTable(rows, { noColor, full });
+}
+function color(s, c, enabled) { return enabled ? `\x1b[${c}m${s}\x1b[0m` : String(s); }
+function printTable(rows, { noColor = true, full = false } = {}) {
+  if (!rows.length) { console.log('(empty)'); return; }
+  const keys = Object.keys(rows[0]);
+  const widths = keys.map((k) => Math.min(full ? 200 : 60, Math.max(k.length, ...rows.map((r) => String(r[k] ?? '').length))));
+  const fmt = (vals) => vals.map((v, i) => String(v ?? '').padEnd(widths[i]).slice(0, widths[i])).join('  ');
+  const dim = (s) => color(s, '2', !noColor);
+  const head = (s) => color(s, '1', !noColor);
+  console.log(head(fmt(keys)));
+  console.log(dim(widths.map((w) => '-'.repeat(w)).join('  ')));
+  for (const row of rows) console.log(fmt(keys.map((k) => row[k])));
+  console.log(`\n${rows.length} row(s)`);
+}
+function printRaw(result, { json }) {
+  if (result.stdout) process.stdout.write(result.stdout.endsWith('\n') ? result.stdout : result.stdout + '\n');
+  if (result.stderr && result.status !== 0) process.stderr.write(result.stderr);
+  if (result.error) console.error(String(result.error.message || result.error));
+  process.exit(result.status === 0 ? EXIT.OK : (result.status || EXIT.OPENCLI_FAIL));
 }
 
-function writeDaemonState(state) {
-  ensureDirOnly();
-  fs.mkdirSync(STORE_DIR, { recursive: true });
-  fs.writeFileSync(
-    DAEMON_STATE,
-    JSON.stringify({ ...state, updated_at: new Date().toISOString() }, null, 2),
-  );
+// ─── facebook arg routing ───────────────────────────────────────────────────
+function effectiveWindow(g, { force } = {}) {
+  if (force) return force;
+  if (g.window === 'foreground' || g.window === 'background') return g.window;
+  return 'background';
 }
-
-function readDaemonState() {
-  try {
-    return JSON.parse(fs.readFileSync(DAEMON_STATE, 'utf8'));
-  } catch {
-    return null;
-  }
+function facebookArgs(sub, extra = [], g, windowMode) {
+  const args = ['facebook', sub, ...extra];
+  if (g.limit != null) args.push('--limit', String(g.limit));
+  const mode = windowMode || effectiveWindow(g);
+  args.push('--window', mode);
+  return args;
 }
-
-function cmdDaemon(sub, g) {
-  const action = sub || 'status';
-
-  if (action === 'start' || action === 'restart') {
-    // Prefer systemd user unit (lightweight, supervised). Fallback: opencli daemon.
-    const hasSystemd =
-      spawnSync('systemctl', ['--user', 'is-system-running'], { encoding: 'utf8' }).status === 0 ||
-      spawnSync('systemctl', ['--user', 'status'], { encoding: 'utf8' }).status === 0 ||
-      fs.existsSync(path.join(os.homedir(), '.config/systemd/user/fb-opencli.service'));
-
-    let via = 'opencli';
-    if (hasSystemd) {
-      spawnSync('systemctl', ['--user', 'daemon-reload'], { encoding: 'utf8' });
-      const u = action === 'restart' ? 'restart' : 'start';
-      const r = spawnSync('systemctl', ['--user', u, 'fb-opencli.service'], {
-        encoding: 'utf8',
-        timeout: 20000,
-      });
-      if (r.status === 0) {
-        via = 'systemd';
-        spawnSync('systemctl', ['--user', 'start', 'fb-hide.timer'], { encoding: 'utf8' });
-      } else {
-        spawnSync(OPENCLI, ['daemon', 'restart'], { encoding: 'utf8', timeout: 30000 });
-      }
-    } else {
-      spawnSync(OPENCLI, ['daemon', 'restart'], { encoding: 'utf8', timeout: 30000 });
-    }
-
-    // Wait briefly for daemon port
-    spawnSync('sleep', ['1']);
-
-    // Lightweight policy: DO NOT spawn a second Chrome.
-    // Reuse existing Chrome with OpenCLI extension. Optional: systemctl --user enable fb-chrome-lean
-    const chromeRunning =
-      spawnSync('pgrep', ['-f', 'google-chrome|chromium'], { encoding: 'utf8' }).status === 0;
-
-    const hidden = hideChromeWindows();
-    const doctor = spawnSync(OPENCLI, ['doctor'], { encoding: 'utf8', timeout: 60000 });
-    const who = opencli(['facebook', 'whoami', '-f', 'json'], {
-      json: true,
-      timeout: 90000,
-      windowMode: 'background',
-    });
-    const me = who.status === 0 ? tryParseJson(who.stdout) : null;
-    const state = {
-      running: true,
-      via,
-      window: 'background',
-      invisible: true,
-      doctor_ok: doctor.status === 0,
-      authenticated: Boolean(me?.logged_in || me?.user_id),
-      user_id: me?.user_id || null,
-      chrome_running: chromeRunning,
-      chrome_hidden: hidden,
-      lightweight: true,
-    };
-    writeDaemonState(state);
-
-    if (g.json) {
-      console.log(JSON.stringify(state, null, 2));
-    } else {
-      console.log(`fb daemon ${action === 'restart' ? 'restarted' : 'started'} via ${via}`);
-      console.log(`  window:    background (invisible)`);
-      console.log(`  opencli:   ${state.doctor_ok ? 'ok' : 'FAIL'} (~60–80MB node bridge)`);
-      console.log(`  auth:      ${state.authenticated ? 'yes' : 'no — run: fb auth'}`);
-      console.log(
-        `  chrome:    ${chromeRunning ? (hidden.ok ? `running, hidden (${hidden.windows})` : 'running') : 'not running — open Chrome once or: fb-service enable-chrome'}`,
-      );
-      console.log(`  store:     ${STORE_DIR}`);
-      console.log(`  manage:    fb-service status | systemctl --user status fb-opencli`);
-      if (!state.authenticated) {
-        console.log('\nFirst-time login (visible once):  fb auth');
-      }
-    }
-    process.exit(state.doctor_ok ? 0 : 1);
-  }
-
-  if (action === 'stop') {
-    spawnSync('systemctl', ['--user', 'stop', 'fb-opencli.service'], { encoding: 'utf8' });
-    spawnSync(OPENCLI, ['daemon', 'stop'], { encoding: 'utf8', timeout: 15000 });
-    writeDaemonState({ running: false, window: 'background', invisible: true });
-    if (g.json) console.log(JSON.stringify({ running: false }, null, 2));
-    else console.log('fb daemon stopped (Chrome left alone — lightweight)');
-    process.exit(0);
-  }
-
-  if (action === 'install') {
-    const r = spawnSync(path.join(os.homedir(), 'bin/fb-service'), ['install'], {
-      encoding: 'utf8',
-      timeout: 60000,
-    });
-    process.stdout.write(r.stdout || '');
-    process.stderr.write(r.stderr || '');
-    process.exit(r.status || 0);
-  }
-
-  if (action === 'status' || action === 'check') {
-    const st = readDaemonState() || {};
-    const doctor = spawnSync(OPENCLI, ['doctor'], { encoding: 'utf8', timeout: 30000 });
-    const who = opencli(['facebook', 'whoami', '-f', 'json'], {
-      json: true,
-      timeout: 60000,
-      windowMode: 'background',
-    });
-    const me = who.status === 0 ? tryParseJson(who.stdout) : null;
-    const status = {
-      version: VERSION,
-      window_default: DEFAULT_WINDOW,
-      invisible: DEFAULT_WINDOW === 'background',
-      daemon_state: st,
-      doctor_ok: doctor.status === 0,
-      doctor_out: (doctor.stdout || '').trim().split('\n').slice(0, 8),
-      authenticated: Boolean(me?.logged_in || me?.user_id),
-      account: me,
-      store: STORE_DIR,
-    };
-    if (g.json) console.log(JSON.stringify(status, null, 2));
-    else {
-      console.log(`fb daemon status (v${VERSION})`);
-      console.log(`  default window: ${DEFAULT_WINDOW} ${DEFAULT_WINDOW === 'background' ? '(invisible)' : '(VISIBLE)'}`);
-      console.log(`  doctor:         ${status.doctor_ok ? 'ok' : 'FAIL'}`);
-      console.log(`  authenticated:  ${status.authenticated ? 'yes' : 'no'}`);
-      if (me?.user_id) console.log(`  user_id:        ${me.user_id}`);
-      console.log(`  store:          ${STORE_DIR}`);
-    }
-    process.exit(status.doctor_ok && status.authenticated ? 0 : 1);
-  }
-
-  if (action === 'hide') {
-    const hidden = hideChromeWindows();
-    if (g.json) console.log(JSON.stringify(hidden, null, 2));
-    else if (hidden.ok) console.log(`hid ${hidden.windows} Chrome window(s)`);
-    else console.log(`hide failed: ${hidden.reason}`);
-    process.exit(hidden.ok ? 0 : 1);
-  }
-
-  console.error('Usage: fb daemon install|start|stop|status|restart|hide');
-  process.exit(2);
-}
-
-function openInBrowser(url) {
-  const candidates = [
-    ['google-chrome', [url]],
-    ['google-chrome-stable', [url]],
-    ['chromium', [url]],
-    ['chromium-browser', [url]],
-    ['xdg-open', [url]],
-  ];
-  for (const [bin, args] of candidates) {
-    const which = spawnSync('which', [bin], { encoding: 'utf8' });
-    if (which.status !== 0) continue;
-    const child = spawn(bin, args, { detached: true, stdio: 'ignore' });
-    child.unref();
-    return bin;
-  }
-  console.error(`Open this URL manually: ${url}`);
-  return null;
-}
-
-function sleepMs(ms) {
-  spawnSync('sleep', [String(ms / 1000)]);
+function runFacebook(sub, extra, g, opts = {}) {
+  const mode = effectiveWindow(g, opts);
+  const result = opencli(facebookArgs(sub, extra, g, mode), {
+    json: true, windowMode: mode, timeout: opts.timeout || 180000,
+  });
+  const parsed = result.status === 0 ? tryParseJson(result.stdout) : null;
+  if (parsed) { emit(asRows(parsed), { json: g.json, plain: g.plain, noColor: g.noColor, full: g.full, kind: sub }); return; }
+  printRaw(result, { json: g.json });
 }
 
 function doctorConnected() {
-  const r = spawnSync(OPENCLI, ['doctor'], { encoding: 'utf8', timeout: 45000 });
+  // doctorConnected is a passive probe — never auto-start for it.
+  // Use bridgeStr() (the URL string), not bridgeCheck (the object).
+  const r = spawnSync(OPENCLI, ['doctor'], { encoding: 'utf8', timeout: 45000, env: { ...process.env, OPENCLI_CDP_ENDPOINT: chromeStr().split(' ')[0] || '' } });
   const out = `${r.stdout || ''}\n${r.stderr || ''}`;
-  const ok =
-    r.status === 0 &&
-    (/Extension:\s*connected/i.test(out) || /Everything looks good/i.test(out));
+  const ok = r.status === 0 && (/Extension:\s*connected/i.test(out) || /Everything looks good/i.test(out));
   return { ok, out, status: r.status };
 }
-
 function facebookLoggedIn() {
-  const r = opencli(['facebook', 'whoami', '-f', 'json'], {
-    json: true,
-    timeout: 90000,
-    windowMode: 'background',
-  });
+  const r = opencli(['facebook', 'whoami', '-f', 'json'], { json: true, timeout: 90000, windowMode: 'background' });
   const me = r.status === 0 ? tryParseJson(r.stdout) : null;
   const ok = Boolean(me && (me.logged_in === true || me.user_id));
   return { ok, me, raw: r };
 }
 
-/** Guided one-time connect: open store → click install → FB login → magic. */
-function cmdSetup(g) {
-  const timeoutMs = Number(process.env.FB_SETUP_TIMEOUT_MS || 10 * 60 * 1000);
-  const pollMs = Number(process.env.FB_SETUP_POLL_MS || 4000);
-  const started = Date.now();
-
-  console.log('');
-  console.log('╔══════════════════════════════════════════════════════╗');
-  console.log('║  fb setup — connect once, then everything is magic ║');
-  console.log('╚══════════════════════════════════════════════════════╝');
-  console.log('');
-  console.log('You only need to click a few things in Chrome.');
-  console.log('I will open the right tabs and wait.');
-  console.log('');
-
-  // Ensure opencli daemon is up
-  spawnSync(OPENCLI, ['daemon', 'restart'], { encoding: 'utf8', timeout: 30000 });
-  sleepMs(1500);
-
-  // --- Step 1: extension ---
-  let d = doctorConnected();
-  if (d.ok) {
-    console.log('✓ OpenCLI extension already connected');
-  } else {
-    console.log('Step 1/2 — Install OpenCLI extension');
-    console.log('  → Opening Chrome Web Store…');
-    console.log('  → Click  “Add to Chrome”  /  “Install”  in the tab that opens');
-    console.log(`  → ${OPENCLI_EXT_URL}`);
-    console.log('');
-    openInBrowser(OPENCLI_EXT_URL);
-    // also try to ensure chrome is up with facebook later
-    process.stdout.write('  Waiting for extension');
-    while (Date.now() - started < timeoutMs) {
-      d = doctorConnected();
-      if (d.ok) {
-        console.log('');
-        console.log('✓ Extension connected');
-        break;
-      }
-      process.stdout.write('.');
-      sleepMs(pollMs);
-    }
-    if (!d.ok) {
-      console.log('');
-      console.error('✗ Timed out waiting for OpenCLI extension.');
-      console.error('  Make sure you clicked Install, then re-run:  fb setup');
-      console.error('  Debug: opencli doctor');
-      process.exit(1);
-    }
-  }
-
-  // --- Step 2: Facebook session ---
-  let auth = facebookLoggedIn();
-  if (auth.ok) {
-    console.log(`✓ Facebook already logged in (user_id=${auth.me.user_id || '?'})`);
-  } else {
-    console.log('');
-    console.log('Step 2/2 — Log into Facebook');
-    console.log('  → Opening Facebook login…');
-    console.log('  → Sign in / complete 2FA in the browser tab');
-    console.log('');
-    openInBrowser(FACEBOOK_LOGIN_URL);
-    // also trigger opencli login flow (foreground) in parallel-ish
-    spawn(
-      OPENCLI,
-      ['facebook', 'login', '--window', 'foreground'],
-      { detached: true, stdio: 'ignore', env: { ...process.env, OPENCLI_WINDOW: 'foreground' } },
-    ).unref();
-
-    process.stdout.write('  Waiting for Facebook session');
-    while (Date.now() - started < timeoutMs) {
-      auth = facebookLoggedIn();
-      if (auth.ok) {
-        console.log('');
-        console.log(`✓ Logged in (user_id=${auth.me.user_id || '?'})`);
-        break;
-      }
-      process.stdout.write('.');
-      sleepMs(pollMs);
-    }
-    if (!auth.ok) {
-      console.log('');
-      console.error('✗ Timed out waiting for Facebook login.');
-      console.error('  Finish login in Chrome, then re-run:  fb setup');
-      console.error('  Or:  fb auth');
-      process.exit(1);
-    }
-  }
-
-  hideChromeWindows();
-
-  // optional services (non-fatal)
-  if (process.env.FB_SETUP_SERVICES !== '0') {
-    const hasSystemd =
-      spawnSync('systemctl', ['--user', 'status'], { encoding: 'utf8' }).status === 0 ||
-      fs.existsSync(path.join(os.homedir(), '.config/systemd/user'));
-    if (hasSystemd) {
-      console.log('');
-      console.log('Enabling lightweight background services…');
-      const svc = path.join(os.homedir(), 'bin/fb-service');
-      if (fs.existsSync(svc)) {
-        spawnSync(svc, ['install'], { encoding: 'utf8', timeout: 60000 });
-      }
-      spawnSync(
-        'systemctl',
-        ['--user', 'enable', '--now', 'fb-chrome-lean.service'],
-        { encoding: 'utf8', timeout: 30000 },
-      );
-      hideChromeWindows();
-    }
-  }
-
-  console.log('');
-  console.log('══════════════════════════════════════════════════════');
-  console.log('  All set. Rest is magic.');
-  console.log('');
-  console.log('  Try:');
-  console.log('    fb whoami');
-  console.log('    fb chats --limit 10');
-  console.log('    fb posts "something" --limit 5');
-  console.log('    fb research "topic" --limit 2');
-  console.log('══════════════════════════════════════════════════════');
-  console.log('');
-
-  if (g.json) {
-    console.log(
-      JSON.stringify(
-        {
-          ok: true,
-          extension: true,
-          authenticated: true,
-          user_id: auth.me?.user_id || null,
-        },
-        null,
-        2,
-      ),
-    );
-  }
-  process.exit(0);
+// ─── daemon state ────────────────────────────────────────────────────────────
+function writeDaemonState(state) {
+  ensureStoreOnly();
+  fs.writeFileSync(DAEMON_STATE, JSON.stringify({ ...state, updated_at: nowIso() }, null, 2));
+}
+function readDaemonState() {
+  try { return JSON.parse(fs.readFileSync(DAEMON_STATE, 'utf8')); } catch { return null; }
 }
 
-function printRaw(result, { json }) {
-  if (result.stdout) process.stdout.write(result.stdout.endsWith('\n') ? result.stdout : result.stdout + '\n');
-  if (result.stderr && result.status !== 0) {
-    process.stderr.write(result.stderr);
-  }
-  if (result.error) {
-    console.error(String(result.error.message || result.error));
-  }
-  process.exit(result.status === 0 ? 0 : result.status || 1);
-}
+// ════════════════════════════════════════════════════════════════════════════
+// SUBCOMMANDS
+// ════════════════════════════════════════════════════════════════════════════
 
-function tryParseJson(text) {
-  const t = text.trim();
-  if (!t) return null;
-  try {
-    return JSON.parse(t);
-  } catch {
-    // opencli sometimes prints YAML-ish or multi docs; try first JSON object/array
-    const startObj = t.indexOf('{');
-    const startArr = t.indexOf('[');
-    let start = -1;
-    if (startObj >= 0 && startArr >= 0) start = Math.min(startObj, startArr);
-    else start = Math.max(startObj, startArr);
-    if (start < 0) return null;
-    try {
-      return JSON.parse(t.slice(start));
-    } catch {
-      return null;
-    }
-  }
-}
-
-function asRows(parsed) {
-  if (parsed == null) return [];
-  if (Array.isArray(parsed)) return parsed;
-  if (typeof parsed === 'object') {
-    // single whoami object or { data: [] }
-    if (Array.isArray(parsed.data)) return parsed.data;
-    return [parsed];
-  }
-  return [];
-}
-
-function printTable(rows) {
-  if (!rows.length) {
-    console.log('(empty)');
-    return;
-  }
-  const keys = Object.keys(rows[0]);
-  const widths = keys.map((k) =>
-    Math.min(
-      60,
-      Math.max(k.length, ...rows.map((r) => String(r[k] ?? '').length)),
-    ),
-  );
-  const line = (vals) =>
-    vals.map((v, i) => String(v ?? '').padEnd(widths[i]).slice(0, widths[i])).join('  ');
-  console.log(line(keys));
-  console.log(widths.map((w) => '-'.repeat(w)).join('  '));
-  for (const row of rows) {
-    console.log(line(keys.map((k) => row[k])));
-  }
-  console.log(`\n${rows.length} row(s)`);
-}
-
-function emit(rows, { json, plain }) {
-  if (json) {
-    console.log(JSON.stringify(rows.length === 1 && !Array.isArray(rows) ? rows[0] : rows, null, 2));
-    return;
-  }
-  if (plain) {
-    for (const row of rows) {
-      if (typeof row === 'object') console.log(Object.values(row).join('\t'));
-      else console.log(row);
-    }
-    return;
-  }
-  printTable(rows);
-}
-
-function usage() {
-  console.log(`fb ${VERSION} — Facebook/Messenger CLI (opencli-backed)
-
-Usage:
-  fb <command> [args] [options]
-
-Setup (do this first — magic after):
-  fb setup                 Guided connect: open extension store → wait → FB login → done
-
-Daemon / services (lightweight):
-  fb daemon install        Install systemd user units (opencli + hide timer)
-  fb daemon start|restart  Prefer systemd fb-opencli.service
-  fb daemon stop           Stop bridge daemon
-  fb daemon status         Health + auth
-  fb daemon hide           Re-hide Chrome off-screen
-  fb-service status        systemctl view of units
-
-Auth / health:
-  fb auth | login          Visible login once (foreground), then stay invisible
-  fb whoami                Show logged-in account
-  fb status                Auth + store + last sync summary
-  fb doctor                opencli doctor + Facebook session probe
-  fb check                 Alias for status
-
-Sync (like wacli sync — snapshot into local SQLite):
-  fb sync [--limit N]      Pull notifications, groups, chats into ~/.local/state/fb/fb.db
-
-Read (live via Chrome session):
-  fb home | feed [--limit N]
-  fb notifications [--limit N]
-  fb groups [--limit N]
-  fb friends [--limit N]
-  fb search <query>                 # top results (mixed)
-  fb posts <query> [--limit N]      # public post search (author + summary + url)
-  fb post <url|fbid>                # deep-read one public post/photo/reel
-  fb research <query> [--limit N]   # posts search + deep-read top results
-  fb profile <username>
-  fb chats | messages [--limit N]
-  fb thread <id|url> [--limit N]
-  fb media|pull <thread|post-url> [--out DIR] [--limit N] [--keep]
-      Unified temp-download for Messenger threads OR public posts
-      (photos/videos/pdf/files/links → ~/.local/state/fb/tmp/<id>)
-  fb open <path>           Open a downloaded file with the system viewer
-  fb keep <path|thread>    Move tmp file(s) to ~/.local/state/fb/keep/
-  fb purge [thread|all]    Delete disposable tmp downloads
-  fb events [--limit N]
-  fb memories [--limit N]
-  fb marketplace listings|inbox [--limit N]
-
-  thread columns include: kind, links, media_urls, attachment_urls
-  (shared FB posts, external links, photo CDN URLs, messenger_media links)
-
-Write:
-  fb send --to <thread_id|url> --message "..."
-  fb add-friend <username>
-  fb join-group <group>
-
-Local store queries (offline after sync):
-  fb db notifications [--limit N]
-  fb db chats [--limit N]
-  fb db groups [--limit N]
-  fb db search <query>
-
-Options:
-  --json, -j          JSON output
-  --plain             TSV-ish plain output
-  --limit, -n <N>     Limit rows
-  --window <mode>     foreground | background (default: background / invisible)
-  --store <dir>       Override store directory
-  -h, --help          Help
-  -V, --version       Version
-
-Environment:
-  OPENCLI_BIN         Path to opencli
-  FB_STORE_DIR        Store directory (default: ~/.local/state/fb)
-  FB_WINDOW           background (default) | foreground
-  OPENCLI_WINDOW      same (opencli-native)
-
-Notes:
-  • Backend is Chrome + OpenCLI extension, but defaults to invisible (background) windows.
-  • Run fb daemon start once per boot; fb auth once if not logged in (visible login).
-  • Messenger + posts adapters live in ~/.opencli/clis/facebook/.
-`);
-}
-
-function effectiveWindow(g, { force } = {}) {
-  if (force) return force;
-  if (g.window === 'foreground' || g.window === 'background') return g.window;
-  return DEFAULT_WINDOW;
-}
-
-function facebookArgs(sub, extra = [], g, windowMode) {
-  const args = ['facebook', sub, ...extra];
-  if (g.limit != null) args.push('--limit', String(g.limit));
-  const mode = windowMode || effectiveWindow(g);
-  // always set explicitly
-  args.push('--window', mode);
-  return args;
-}
-
-function runFacebook(sub, extra, g, opts = {}) {
-  const mode = effectiveWindow(g, opts);
-  const result = opencli(facebookArgs(sub, extra, g, mode), {
-    json: true,
-    windowMode: mode,
-    timeout: opts.timeout || 180000,
-  });
-  const parsed = result.status === 0 ? tryParseJson(result.stdout) : null;
-  if (parsed) {
-    emit(asRows(parsed), g);
-    process.exit(0);
-  }
-  printRaw(result, g);
-}
-
-function setMeta(key, value) {
-  const ts = nowIso();
-  runSql(
-    `INSERT INTO meta(key,value,updated_at) VALUES('${sqlEscape(key)}','${sqlEscape(value)}','${ts}')
-     ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at;`,
-  );
-}
-
-function getMeta(key) {
-  const out = runSql(`SELECT value FROM meta WHERE key='${sqlEscape(key)}' LIMIT 1;`).trim();
-  return out || null;
-}
-
-function cmdSync(g) {
-  ensureStore();
-  const limit = g.limit || '30';
-  const report = { ok: true, notifications: 0, groups: 0, chats: 0, errors: [] };
-  const ts = nowIso();
-
-  function pull(name, opencliSub, mapRow) {
-    const r = opencli(['facebook', opencliSub, '--limit', String(limit), '-f', 'json'], {
-      json: true,
-      timeout: 180000,
-    });
-    if (r.status !== 0) {
-      report.errors.push({ name, error: (r.stderr || r.stdout || 'failed').trim().slice(0, 300) });
-      return [];
-    }
-    const rows = asRows(tryParseJson(r.stdout));
-    return rows;
-  }
-
-  // notifications
-  try {
-    const rows = pull('notifications', 'notifications');
-    for (const row of rows) {
-      const id = row.notif_id || row.Notif_id || row.url || `${row.text}-${row.time}`;
-      runSql(
-        `INSERT INTO notifications(notif_id,unread,text,time,url,notif_type,synced_at)
-         VALUES('${sqlEscape(id)}',${row.unread ? 1 : 0},'${sqlEscape(row.text)}','${sqlEscape(row.time)}','${sqlEscape(row.url)}','${sqlEscape(row.notif_type || row.Notif_type)}','${ts}')
-         ON CONFLICT(notif_id) DO UPDATE SET
-           unread=excluded.unread, text=excluded.text, time=excluded.time,
-           url=excluded.url, notif_type=excluded.notif_type, synced_at=excluded.synced_at;`,
-      );
-    }
-    report.notifications = rows.length;
-  } catch (e) {
-    report.errors.push({ name: 'notifications', error: String(e.message || e) });
-  }
-
-  // groups
-  try {
-    const rows = pull('groups', 'groups');
-    for (const row of rows) {
-      const url = row.url || row.Url || row.name;
-      runSql(
-        `INSERT INTO groups(url,name,last_post,synced_at)
-         VALUES('${sqlEscape(url)}','${sqlEscape(row.name)}','${sqlEscape(row.last_post || row.Last_post || '')}','${ts}')
-         ON CONFLICT(url) DO UPDATE SET name=excluded.name, last_post=excluded.last_post, synced_at=excluded.synced_at;`,
-      );
-    }
-    report.groups = rows.length;
-  } catch (e) {
-    report.errors.push({ name: 'groups', error: String(e.message || e) });
-  }
-
-  // chats / messages inbox
-  try {
-    const rows = pull('chats', 'messages');
-    for (const row of rows) {
-      const tid = row.thread_id || row.threadId;
-      if (!tid) continue;
-      runSql(
-        `INSERT INTO chats(thread_id,name,snippet,time,unread,url,synced_at)
-         VALUES('${sqlEscape(tid)}','${sqlEscape(row.name)}','${sqlEscape(row.snippet)}','${sqlEscape(row.time)}',${row.unread ? 1 : 0},'${sqlEscape(row.url)}','${ts}')
-         ON CONFLICT(thread_id) DO UPDATE SET
-           name=excluded.name, snippet=excluded.snippet, time=excluded.time,
-           unread=excluded.unread, url=excluded.url, synced_at=excluded.synced_at;`,
-      );
-    }
-    report.chats = rows.length;
-  } catch (e) {
-    report.errors.push({ name: 'chats', error: String(e.message || e) });
-  }
-
-  // whoami cache
-  try {
-    const r = opencli(['facebook', 'whoami', '-f', 'json'], { json: true });
-    if (r.status === 0) {
-      const me = tryParseJson(r.stdout);
-      if (me) setMeta('whoami', JSON.stringify(me));
-    }
-  } catch {
-    /* ignore */
-  }
-
-  setMeta('last_sync', ts);
-  setMeta('last_sync_report', JSON.stringify(report));
-  report.ok = report.errors.length === 0;
-  report.store = DB_PATH;
-  report.synced_at = ts;
-
-  if (g.json) console.log(JSON.stringify(report, null, 2));
+function cmdVersion(g) {
+  const bridge = bridgeCheck({ autoStart: false });
+  const info = {
+    version: VERSION, program: PROGRAM, node: process.version,
+    opencli: which(OPENCLI) || OPENCLI,
+    bridge_ok: bridge.ok,
+    daemon: bridge.url || null,
+    chrome: bridge.chrome ? { url: bridge.chrome.url, headless: bridge.chrome.headless } : null,
+    bridge_detail: bridge.ok ? null : bridge.reason,
+    store: cfgStore(),
+    config: fileExists(CONFIG_PATH) ? CONFIG_PATH : null,
+    account: g.account,
+  };
+  if (g.json) console.log(JSON.stringify(info, null, 2));
   else {
-    console.log(`fb sync ${report.ok ? 'OK' : 'PARTIAL'}`);
-    console.log(`  notifications: ${report.notifications}`);
-    console.log(`  groups:        ${report.groups}`);
-    console.log(`  chats:         ${report.chats}`);
-    console.log(`  store:         ${DB_PATH}`);
-    if (report.errors.length) {
-      console.log('  errors:');
-      for (const e of report.errors) console.log(`    - ${e.name}: ${e.error}`);
-    }
+    console.log(`${PROGRAM} ${VERSION}`);
+    console.log(`  node:     ${info.node}`);
+    console.log(`  opencli:  ${info.opencli}`);
+    console.log(`  bridge:   ${bridgeStr()}`);
+    console.log(`  store:    ${info.store}`);
+    console.log(`  config:   ${info.config || '(none)'}`);
+    console.log(`  account:  ${info.account}`);
   }
-  process.exit(report.ok ? 0 : 1);
+}
+
+function cmdCompletion(g, args) {
+  const shell = args[0] || 'bash';
+  const scripts = {
+    bash: `
+_fb_completions() {
+  local cur cmds
+  COMPREPLY=()
+  cur="\${COMP_WORDS[COMP_CWORD]}"
+  cmds="setup connect onboard daemon auth login whoami status check doctor version completion accounts store profile sync home feed notifications notifs groups friends search posts search-posts post read-post research chats messages inbox thread read media pull download-media open keep purge send add-friend join-group events memories marketplace db docs help"
+  if [[ \${cur} == -* ]]; then
+    COMPREPLY=( \$(compgen -W "--json --events --read-only --plain --full --no-color --account --store --timeout --limit --window --help --version" -- "\${cur}") )
+    return 0
+  fi
+  COMPREPLY=( \$(compgen -W "\${cmds}" -- "\${cur}") )
+}
+complete -F _fb_completions fb
+`,
+    zsh: `#compdef fb
+_fb() {
+  local -a subcommands
+  subcommands=('setup:Guided connect' 'connect:Alias for setup' 'onboard:Alias for setup' 'daemon:opencli daemon manager' 'auth:Visible login' 'login:Alias for auth' 'whoami:Show account' 'status:Health summary' 'check:Alias for status' 'doctor:opencli + FB + store' 'version:Print version' 'completion:Shell completion' 'accounts:Multi-account' 'store:Store introspection' 'profile:Public profile' 'sync:Pull to local store' 'home:Home feed' 'feed:Alias for home' 'notifications:List notifications' 'notifs:Alias for notifications' 'groups:List groups' 'friends:List friends' 'search:Top results' 'posts:Public post search' 'search-posts:Alias for posts' 'post:Read one public post' 'read-post:Alias for post' 'research:Posts + deep-read' 'chats:List chats' 'messages:Store queries' 'inbox:Alias for chats' 'thread:Read one thread' 'read:Alias for thread' 'media:Download media' 'pull:Alias for media' 'download-media:Alias for media' 'open:Open downloaded file' 'keep:Move to keep/' 'purge:Delete tmp' 'send:Send a message' 'add-friend:Send friend request' 'join-group:Join group' 'events:List events' 'memories:List memories' 'marketplace:Marketplace queries' 'db:Raw store queries' 'docs:Repo / docs URL' 'help:Show help')
+  _arguments -s '--json[JSON]' '--events[NDJSON events]' '--read-only[Refuse writes]' '--plain[TSV]' '--full[No truncation]' '--no-color[No colors]' '--account[Account name]:name:' '--store[Store dir]:dir:_files' '--timeout[Timeout]:duration:' '--limit[Row limit]:n:' '--window[Window mode]:mode:(background foreground)' '(-h --help)'{-h,--help}'[Help]' '(-V --version)'{-V,--version}'[Version]' '*::subcommand:->subcmd'
+  case \$state in subcmd) _describe -t subcommands 'fb subcommand' subcommands ;; esac
+}
+_fb "\$@"
+`,
+    fish: `function __fb_subcommands
+  echo setup connect onboard daemon auth login whoami status check doctor version completion accounts store profile sync home feed notifications notifs groups friends search posts search-posts post read-post research chats messages inbox thread read media pull download-media open keep purge send add-friend join-group events memories marketplace db docs help
+end
+complete -c fb -f -n "__fish_use_subcommand" -a "(__fb_subcommands)"
+complete -c fb -l json -d 'JSON output' -l events -d 'NDJSON events' -l read-only -d 'Refuse writes' -l plain -d 'TSV' -l full -d 'No truncation' -l no-color -d 'No colors' -l account -d 'Account name' -r -l store -d 'Store dir' -r -l timeout -d 'Timeout' -r -l limit -d 'Row limit' -r -l window -d 'Window mode' -r
+`,
+    pwsh: `$fb_completer = {
+  param($wordToComplete)
+  $cmds = @('setup','connect','onboard','daemon','auth','login','whoami','status','check','doctor','version','completion','accounts','store','profile','sync','home','feed','notifications','notifs','groups','friends','search','posts','search-posts','post','read-post','research','chats','messages','inbox','thread','read','media','pull','download-media','open','keep','purge','send','add-friend','join-group','events','memories','marketplace','db','docs','help')
+  $flags = @('--json','--events','--read-only','--plain','--full','--no-color','--account','--store','--timeout','--limit','--window','--help','--version')
+  $candidates = $cmds + $flags
+  $candidates | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
+    [System.Management.Automation.CompletionResult]::new($_, $_, 'Parameter', $_)
+  }
+}
+`,
+  };
+  const s = scripts[shell];
+  if (!s) die(`unknown shell: ${shell}. Try: bash | zsh | fish | pwsh`, EXIT.USAGE, { json: g.json });
+  process.stdout.write(s.trimStart());
+  if (g.json) process.stderr.write(JSON.stringify({ ok: true, shell, bytes: s.length }, null, 2));
+}
+
+function cmdAccounts(g, args) {
+  ensureStore();
+  const sub = args[0] || 'list';
+  if (sub === 'list' || sub === 'ls') {
+    const rows = runSql(`SELECT name, COALESCE(user_id,'') AS user_id, COALESCE(display_name,'') AS display_name, created_at, COALESCE(last_used_at,'-') AS last_used_at FROM accounts ORDER BY name;`);
+    if (g.json) {
+      const arr = rows.split('\n').filter(Boolean).map((l) => l.split('|'));
+      const keys = ['name','user_id','display_name','created_at','last_used_at'];
+      emit(arr.map((v) => Object.fromEntries(keys.map((k, i) => [k, v[i]]))), { json: true, kind: 'accounts.list' });
+      return;
+    }
+    if (!rows.trim()) { console.log('(no accounts — run `fb auth`)'); return; }
+    const lines = rows.trim().split('\n');
+    const keys = ['name','user_id','display_name','created_at','last_used_at'];
+    emit(lines.map((l) => Object.fromEntries(keys.map((k, i) => [k, l.split('|')[i]]))), { json: g.json, plain: g.plain, noColor: g.noColor, kind: 'accounts.list' });
+  } else if (sub === 'add') {
+    const name = args[1]; if (!name) die('Usage: fb accounts add <name>', EXIT.USAGE, { json: g.json });
+    rejectIfReadOnly('add account');
+    const ts = nowIso();
+    runSql(`INSERT INTO accounts(name, created_at) VALUES('${sqlEscape(name)}','${ts}') ON CONFLICT(name) DO NOTHING;`);
+    emit({ ok: true, name, created_at: ts }, { json: g.json, kind: 'accounts.add' });
+  } else if (sub === 'use') {
+    const name = args[1]; if (!name) die('Usage: fb accounts use <name>', EXIT.USAGE, { json: g.json });
+    const exists = runSql(`SELECT 1 FROM accounts WHERE name='${sqlEscape(name)}';`).trim();
+    if (!exists) die(`unknown account: ${name}`, EXIT.NOT_FOUND, { json: g.json });
+    setMeta('current_account', name);
+    emit({ ok: true, account: name }, { json: g.json, kind: 'accounts.use' });
+  } else if (sub === 'rm' || sub === 'remove') {
+    const name = args[1]; if (!name) die('Usage: fb accounts rm <name>', EXIT.USAGE, { json: g.json });
+    rejectIfReadOnly('remove account');
+    runSql(`DELETE FROM accounts WHERE name='${sqlEscape(name)}';`);
+    emit({ ok: true, removed: name }, { json: g.json, kind: 'accounts.rm' });
+  } else if (sub === '--help' || sub === 'help') {
+    console.log(`fb accounts — manage named accounts\n\n  fb accounts list\n  fb accounts add <name>\n  fb accounts use <name>\n  fb accounts rm <name>\n  fb --account NAME ...        # per-command override`);
+  } else {
+    die(`unknown accounts subcommand: ${sub}`, EXIT.USAGE, { json: g.json });
+  }
+}
+
+function cmdStore(g, args) {
+  ensureStore();
+  const sub = args[0] || 'info';
+  if (sub === 'info') {
+    const dbSize = fs.existsSync(DB_PATH) ? fs.statSync(DB_PATH).size : 0;
+    const lock = readLock();
+    const counts = {
+      accounts: Number(runSql('SELECT COUNT(*) FROM accounts;').trim() || 0),
+      notifications: Number(runSql('SELECT COUNT(*) FROM notifications;').trim() || 0),
+      groups: Number(runSql('SELECT COUNT(*) FROM groups;').trim() || 0),
+      chats: Number(runSql('SELECT COUNT(*) FROM chats;').trim() || 0),
+      messages: Number(runSql('SELECT COUNT(*) FROM messages;').trim() || 0),
+    };
+    const fts = {
+      messages_fts: Number(runSql('SELECT COUNT(*) FROM messages_fts;').trim() || 0),
+      notifications_fts: Number(runSql('SELECT COUNT(*) FROM notifications_fts;').trim() || 0),
+      groups_fts: Number(runSql('SELECT COUNT(*) FROM groups_fts;').trim() || 0),
+    };
+    const cdp = daemonStr();
+    const payload = { path: STORE_DIR, db: DB_PATH, db_size: dbSize, lock, counts, fts, cdp, last_sync: getMeta('last_sync') };
+    if (g.json) console.log(JSON.stringify(stamp(payload, 'store.info'), null, 2));
+    else {
+      console.log(`fb store`);
+      console.log(`  path:      ${STORE_DIR}`);
+      console.log(`  db:        ${DB_PATH}  (${(dbSize/1024).toFixed(1)} KB)`);
+      console.log(`  cdp:       ${cdp || 'NOT FOUND'}`);
+      console.log(`  lock:      ${lock ? `held by pid=${lock.pid} user=${lock.user}` : 'free'}`);
+      console.log(`  fts:       messages=${fts.messages_fts}  notifs=${fts.notifications_fts}  groups=${fts.groups_fts}`);
+      console.log(`  counts:    ${JSON.stringify(counts)}`);
+      console.log(`  last_sync: ${payload.last_sync || '(never)'}`);
+    }
+  } else if (sub === 'prune') {
+    rejectIfReadOnly('prune store');
+    const days = Number(args[1] || 90);
+    const cutoff = new Date(Date.now() - days * 86400_000).toISOString();
+    const before = {
+      notifs: Number(runSql('SELECT COUNT(*) FROM notifications;').trim() || 0),
+      groups: Number(runSql('SELECT COUNT(*) FROM groups;').trim() || 0),
+      chats: Number(runSql('SELECT COUNT(*) FROM chats;').trim() || 0),
+      messages: Number(runSql('SELECT COUNT(*) FROM messages;').trim() || 0),
+    };
+    runSql(`DELETE FROM notifications WHERE synced_at < '${cutoff}';`);
+    runSql(`DELETE FROM groups WHERE synced_at < '${cutoff}';`);
+    runSql(`DELETE FROM chats WHERE synced_at < '${cutoff}';`);
+    runSql(`DELETE FROM messages WHERE synced_at < '${cutoff}';`);
+    runSql('VACUUM;');
+    const after = {
+      notifs: Number(runSql('SELECT COUNT(*) FROM notifications;').trim() || 0),
+      groups: Number(runSql('SELECT COUNT(*) FROM groups;').trim() || 0),
+      chats: Number(runSql('SELECT COUNT(*) FROM chats;').trim() || 0),
+      messages: Number(runSql('SELECT COUNT(*) FROM messages;').trim() || 0),
+    };
+    const payload = { cutoff, days, before, after };
+    if (g.json) console.log(JSON.stringify(stamp({ ...payload, ok: true }, 'store.prune'), null, 2));
+    else {
+      console.log(`fb store prune: removed rows synced before ${cutoff}`);
+      for (const k of Object.keys(before)) console.log(`  ${k.padEnd(10)} ${before[k]} → ${after[k]}  (Δ ${after[k] - before[k]})`);
+    }
+  } else if (sub === 'reset') {
+    rejectIfReadOnly('reset store');
+    if (!g.json) console.error('fb store reset: removing db + cache (not keep/, not tmp/)');
+    fs.rmSync(DB_PATH, { force: true });
+    for (const f of fs.readdirSync(CACHE_DIR)) fs.rmSync(path.join(CACHE_DIR, f), { recursive: true, force: true });
+    ensureStore();
+    if (g.json) console.log(JSON.stringify({ ok: true, action: 'reset', path: STORE_DIR }, null, 2));
+  } else if (sub === 'lock') {
+    const wait = Number(args[1] || 0);
+    const r = acquireLock({ wait });
+    if (g.json) console.log(JSON.stringify(r, null, 2));
+    else if (r.ok) console.log(`lock acquired (pid=${r.owner.pid})`);
+    else { console.error(`locked by pid=${lock.owner?.pid} user=${lock.owner?.user} since ${lock.owner?.started_at}`); process.exit(EXIT.LOCKED); }
+  } else if (sub === '--help' || sub === 'help') {
+    console.log(`fb store — local SQLite store introspection\n\n  fb store info             Counts, sizes, lock holder, FTS indexes, CDP\n  fb store prune [days]     Delete rows older than <days> (default 90), then VACUUM\n  fb store reset            Delete the db + cache (keeps keep/ and tmp/)\n  fb store lock [wait_sec]  Try to acquire the store lock`);
+  } else {
+    die(`unknown store subcommand: ${sub}`, EXIT.USAGE, { json: g.json });
+  }
+}
+
+function cmdDocs(g) {
+  const url = 'https://github.com/xzeroone/fb-cli';
+  const payload = { program: PROGRAM, version: VERSION, repo: url, wacli_parity: true };
+  if (g.json) console.log(JSON.stringify(payload, null, 2));
+  else {
+    console.log(`${PROGRAM} ${VERSION}`);
+    console.log(`  repo:    ${url}`);
+    console.log(`  wacli parity: yes (--json, --events, --read-only, --account, --store, --timeout, FTS5, lock)`);
+  }
+}
+
+function cmdProfile(g, args) {
+  const sub = args[0];
+  if (!sub || sub === '--help' || sub === 'help') {
+    console.log(`fb profile — public profile lookup or own profile\n\n  fb profile <username>             Fetch a public profile\n  fb profile set --display <name>   Update your own display name (best-effort, opencli)\n  fb profile whoami                 Show your own profile as JSON`);
+    return;
+  }
+  if (sub === 'set') {
+    rejectIfReadOnly('set profile');
+    let display = null, bio = null, website = null;
+    for (let i = 1; i < args.length; i += 1) {
+      const a = args[i];
+      if (a === '--display') display = args[++i];
+      else if (a === '--bio') bio = args[++i];
+      else if (a === '--website') website = args[++i];
+    }
+    if (!display && !bio && !website) die('Usage: fb profile set --display <name> [--bio <bio>] [--website <url>]', EXIT.USAGE, { json: g.json });
+    const auth = facebookLoggedIn();
+    if (!auth.ok) die('not authenticated — run: fb auth', EXIT.NOT_AUTHED, { json: g.json });
+    const extra = [];
+    if (display) extra.push('--display', display);
+    if (bio) extra.push('--bio', bio);
+    if (website) extra.push('--website', website);
+    const r = opencli(['facebook', 'profile-set', ...extra, '-f', 'json'], { json: true, windowMode: 'foreground' });
+    printRaw(r, { json: g.json });
+  } else if (sub === 'whoami') {
+    runFacebook('whoami', [], g);
+  } else {
+    runFacebook('profile', [sub], g);
+  }
+}
+
+function cmdMessages(g, args) {
+  const sub = args[0] || 'list';
+  if (sub === 'list' || sub === 'ls') {
+    const limit = Number(g.limit || 50);
+    const chat = args[1] || null;
+    const since = args[2] || null;
+    const params = [];
+    let where = '1=1';
+    if (chat) { where += ' AND thread_id = ?'; params.push(chat); }
+    if (since) {
+      const iso = parseSince(since);
+      if (iso) { where += ' AND time >= ?'; params.push(iso); }
+    }
+    const sql = `SELECT id, thread_id, COALESCE(sender,'-') AS sender, CASE WHEN from_me=1 THEN 'me' ELSE 'them' END AS dir, substr(text,1,200) AS text, time FROM messages WHERE ${where} AND account = ? ORDER BY id DESC LIMIT ?;`;
+    params.push(_account, limit);
+    const out = runSql(sql, params);
+    const rows = out.split('\n').filter(Boolean).map((l) => l.split('|'));
+    const keys = ['id','thread_id','sender','dir','text','time'];
+    if (g.json) { emit(rows.map((v) => Object.fromEntries(keys.map((k, i) => [k, v[i]]))), { json: true, kind: 'messages.list' }); return; }
+    emit(rows.map((v) => Object.fromEntries(keys.map((k, i) => [k, v[i]]))), { json: false, plain: g.plain, noColor: g.noColor, kind: 'messages.list' });
+  } else if (sub === 'show') {
+    const id = args[1]; if (!id) die('Usage: fb messages show <id>', EXIT.USAGE, { json: g.json });
+    const out = runSql(`SELECT id, thread_id, sender, CASE WHEN from_me=1 THEN 'me' ELSE 'them' END AS dir, text, time, synced_at FROM messages WHERE id = ? AND account = ? LIMIT 1;`, [id, _account]);
+    if (!out.trim()) die(`message not found: ${id}`, EXIT.NOT_FOUND, { json: g.json });
+    const [vals] = out.trim().split('\n').map((l) => l.split('|'));
+    const keys = ['id','thread_id','sender','dir','text','time','synced_at'];
+    const row = Object.fromEntries(keys.map((k, i) => [k, vals[i]]));
+    if (g.json) console.log(JSON.stringify(stamp(row, 'messages.show'), null, 2));
+    else { for (const [k, v] of Object.entries(row)) console.log(`  ${k.padEnd(10)} ${v}`); }
+  } else if (sub === 'search') {
+    const q = args.slice(1).join(' ').trim();
+    if (!q) die('Usage: fb messages search <query>', EXIT.USAGE, { json: g.json });
+    const limit = Number(g.limit || 25);
+    let ftsAvailable = true;
+    let rows = [];
+    try {
+      const sql = `SELECT m.id, m.thread_id, COALESCE(m.sender,'-') AS sender, CASE WHEN m.from_me=1 THEN 'me' ELSE 'them' END AS dir, m.text, m.time FROM messages_fts f JOIN messages m ON m.id = f.rowid WHERE messages_fts MATCH ? AND m.account = ? ORDER BY rank LIMIT ?;`;
+      const out = runSql(sql, [ftsQuery(q), _account, limit]);
+      rows = out.split('\n').filter(Boolean).map((l) => l.split('|'));
+    } catch (e) {
+      ftsAvailable = false;
+      const sql = `SELECT id, thread_id, COALESCE(sender,'-') AS sender, CASE WHEN from_me=1 THEN 'me' ELSE 'them' END AS dir, text, time FROM messages WHERE text LIKE ? AND account = ? ORDER BY id DESC LIMIT ?;`;
+      const out = runSql(sql, [`%${q}%`, _account, limit]);
+      rows = out.split('\n').filter(Boolean).map((l) => l.split('|'));
+    }
+    const keys = ['id','thread_id','sender','dir','text','time'];
+    const data = rows.map((v) => Object.fromEntries(keys.map((k, i) => [k, v[i]])));
+    if (g.json) { console.log(JSON.stringify(stamp({ query: q, fts: ftsAvailable, count: data.length, data }, 'messages.search'), null, 2)); return; }
+    if (!data.length) { console.log('(no matches)'); return; }
+    emit(data, { json: false, plain: g.plain, noColor: g.noColor, kind: 'messages.search' });
+  } else if (sub === '--help' || sub === 'help') {
+    console.log(`fb messages — local store queries (offline after sync)\n\n  fb messages list [chat] [since]      List messages\n  fb messages show <id>                Show one message\n  fb messages search <query>           FTS5 search (or LIKE fallback)`);
+  } else {
+    die(`unknown messages subcommand: ${sub}`, EXIT.USAGE, { json: g.json });
+  }
+}
+
+function parseSince(s) {
+  if (!s) return null;
+  const rel = s.match(/^(\d+)([smhdw])$/);
+  if (rel) {
+    const n = Number(rel[1]);
+    const unit = { s: 1, m: 60, h: 3600, d: 86400, w: 604800 }[rel[2]];
+    return new Date(Date.now() - n * unit * 1000).toISOString();
+  }
+  const d = new Date(s);
+  if (!isNaN(d.getTime())) return d.toISOString();
+  return null;
+}
+function ftsQuery(q) {
+  return q.split(/\s+/).filter(Boolean).map((t) => `"${t.replace(/"/g, '""')}"*`).join(' ');
+}
+
+// ─── daemon (now just wraps opencli) ────────────────────────────────────────
+function cmdDaemon(g, args) {
+  const action = args[0] || 'status';
+  const cdp = daemonStr();
+
+  if (action === 'start' || action === 'restart') {
+    // opencli daemon: starts the opencli Node bridge on 19825
+    const r = spawnSync(OPENCLI, ['daemon', action === 'restart' ? 'restart' : 'start'], { encoding: 'utf8', timeout: 30000 });
+    sleepMs(800);
+    const cdpAfter = daemonCheck();
+    const doctor = spawnSync(OPENCLI, ['doctor'], { encoding: 'utf8', timeout: 30000 });
+    const who = opencli(['facebook', 'whoami', '-f', 'json'], { json: true, timeout: 60000 });
+    const me = who.status === 0 ? tryParseJson(who.stdout) : null;
+    const state = { running: true, cdp: cdpAfter, doctor_ok: doctor.status === 0, authenticated: Boolean(me?.logged_in || me?.user_id), user_id: me?.user_id || null };
+    writeDaemonState(state);
+    if (g.json) console.log(JSON.stringify(stamp(state, 'daemon.start'), null, 2));
+    else {
+      console.log(`fb daemon ${action} via opencli`);
+      console.log(`  cdp:       ${state.cdp || 'NOT FOUND'}`);
+      console.log(`  opencli:   ${state.doctor_ok ? 'ok' : 'FAIL'}`);
+      console.log(`  auth:      ${state.authenticated ? `yes (user_id=${state.user_id})` : 'no — run: fb auth'}`);
+      if (!state.cdp) console.log('  tip:       if you want zero visible UI, run: fb-headless start');
+    }
+    process.exit(state.doctor_ok ? EXIT.OK : EXIT.OPENCLI_FAIL);
+  }
+  if (action === 'stop') {
+    spawnSync(OPENCLI, ['daemon', 'stop'], { encoding: 'utf8', timeout: 15000 });
+    writeDaemonState({ running: false });
+    if (g.json) console.log(JSON.stringify({ running: false }, null, 2)); else console.log('fb daemon stopped (Chrome left alone — close it manually if you want)');
+    process.exit(EXIT.OK);
+  }
+  if (action === 'status' || action === 'check') {
+    const st = readDaemonState() || {};
+    const doctor = spawnSync(OPENCLI, ['doctor'], { encoding: 'utf8', timeout: 30000 });
+    const who = opencli(['facebook', 'whoami', '-f', 'json'], { json: true, timeout: 60000 });
+    const me = who.status === 0 ? tryParseJson(who.stdout) : null;
+    const status = { version: VERSION, cdp, daemon_state: st, doctor_ok: doctor.status === 0, authenticated: Boolean(me?.logged_in || me?.user_id), account: me, store: STORE_DIR };
+    if (g.json) console.log(JSON.stringify(stamp(status, 'daemon.status'), null, 2));
+    else {
+      console.log(`fb daemon status (v${VERSION})`);
+      console.log(`  cdp:          ${cdp || 'NOT FOUND'}`);
+      console.log(`  opencli:      ${status.doctor_ok ? 'ok' : 'FAIL'}`);
+      console.log(`  authenticated: ${status.authenticated ? 'yes' : 'no'}`);
+      if (me?.user_id) console.log(`  user_id:      ${me.user_id}`);
+      console.log(`  store:        ${STORE_DIR}`);
+    }
+    process.exit(status.doctor_ok && status.authenticated ? EXIT.OK : EXIT.OPENCLI_FAIL);
+  }
+  die('Usage: fb daemon start|stop|status|restart', EXIT.USAGE, { json: g.json });
 }
 
 function cmdStatus(g) {
@@ -971,39 +889,33 @@ function cmdStatus(g) {
   const me = who.status === 0 ? tryParseJson(who.stdout) : null;
   const lastSync = getMeta('last_sync');
   const counts = {
-    notifications: Number(runSql('SELECT COUNT(*) FROM notifications;').trim() || 0),
-    groups: Number(runSql('SELECT COUNT(*) FROM groups;').trim() || 0),
-    chats: Number(runSql('SELECT COUNT(*) FROM chats;').trim() || 0),
+    notifications: Number(runSql(`SELECT COUNT(*) FROM notifications WHERE account='${sqlEscape(_account)}';`).trim() || 0),
+    groups: Number(runSql(`SELECT COUNT(*) FROM groups WHERE account='${sqlEscape(_account)}';`).trim() || 0),
+    chats: Number(runSql(`SELECT COUNT(*) FROM chats WHERE account='${sqlEscape(_account)}';`).trim() || 0),
+    messages: Number(runSql(`SELECT COUNT(*) FROM messages WHERE account='${sqlEscape(_account)}';`).trim() || 0),
   };
-  const status = {
-    version: VERSION,
-    opencli: OPENCLI,
-    store: DB_PATH,
-    authenticated: Boolean(me?.logged_in || me?.user_id),
-    account: me,
-    last_sync: lastSync,
-    local_counts: counts,
-    doctor_ok: doctor.status === 0,
+  const fts = {
+    messages: Number(runSql('SELECT COUNT(*) FROM messages_fts;').trim() || 0),
+    notifications: Number(runSql('SELECT COUNT(*) FROM notifications_fts;').trim() || 0),
+    groups: Number(runSql('SELECT COUNT(*) FROM groups_fts;').trim() || 0),
   };
-  if (g.json) {
-    console.log(JSON.stringify(status, null, 2));
-  } else {
+  const cdp = daemonStr();
+  const status = { version: VERSION, opencli: OPENCLI, cdp, store: DB_PATH, authenticated: Boolean(me?.logged_in || me?.user_id), account: me, last_sync: lastSync, local_counts: counts, fts, doctor_ok: doctor.status === 0 };
+  if (g.json) console.log(JSON.stringify(stamp(status, 'status'), null, 2));
+  else {
     console.log(`fb ${VERSION}`);
-    console.log(`  opencli:   ${OPENCLI}`);
-    console.log(`  store:     ${DB_PATH}`);
-    console.log(`  doctor:    ${status.doctor_ok ? 'ok' : 'FAIL'}`);
-    console.log(
-      `  auth:      ${status.authenticated ? 'yes' : 'no'}${me?.user_id ? ` (user_id=${me.user_id})` : ''}`,
-    );
-    console.log(`  last_sync: ${lastSync || '(never)'}`);
-    console.log(
-      `  local:     notifs=${counts.notifications} groups=${counts.groups} chats=${counts.chats}`,
-    );
-    if (!status.authenticated) {
-      console.log('\nRun: fb auth');
-    }
+    console.log(`  opencli:    ${OPENCLI}`);
+    console.log(`  cdp:        ${cdp || 'NOT FOUND'}`);
+    console.log(`  store:      ${DB_PATH}`);
+    console.log(`  doctor:     ${status.doctor_ok ? 'ok' : 'FAIL'}`);
+    console.log(`  auth:       ${status.authenticated ? 'yes' : 'no'}${me?.user_id ? ` (user_id=${me.user_id})` : ''}`);
+    console.log(`  last_sync:  ${lastSync || '(never)'}`);
+    console.log(`  local:      notifs=${counts.notifications} groups=${counts.groups} chats=${counts.chats} messages=${counts.messages}`);
+    console.log(`  fts:        messages=${fts.messages} notifs=${fts.notifications} groups=${fts.groups}`);
+    if (!cdp) console.log('\nNo CDP endpoint found. Run: opencli facebook login');
+    if (!status.authenticated) console.log('\nRun: fb auth');
   }
-  process.exit(status.authenticated && status.doctor_ok ? 0 : 1);
+  process.exit(status.authenticated && status.doctor_ok ? EXIT.OK : EXIT.NOT_AUTHED);
 }
 
 function cmdDoctor(g) {
@@ -1012,305 +924,388 @@ function cmdDoctor(g) {
   process.stderr.write(r.stderr || '');
   console.log('\n--- Facebook session ---');
   const who = opencli(['facebook', 'whoami', '-f', 'json'], { json: true });
-  if (who.status === 0) {
-    console.log(who.stdout.trim());
-  } else {
-    console.log('Not authenticated or whoami failed.');
-    console.log((who.stderr || who.stdout || '').trim().slice(0, 400));
-  }
-  process.exit(r.status === 0 && who.status === 0 ? 0 : 1);
+  if (who.status === 0) console.log(who.stdout.trim());
+  else { console.log('Not authenticated or whoami failed.'); console.log((who.stderr || who.stdout || '').trim().slice(0, 400)); }
+  console.log('\n--- Store ---');
+  try { cmdStore({ ...g, json: false }, ['info']); } catch (e) { console.log(`store: ${e.message}`); }
+  process.exit(r.status === 0 && who.status === 0 ? EXIT.OK : EXIT.OPENCLI_FAIL);
 }
 
-function cmdDb(sub, queryArgs, g) {
+function cmdSync(g) {
   ensureStore();
+  const lock = acquireLock({ wait: Number(g.timeout || 30) });
+  if (!lock.ok) die(`store locked by pid=${lock.owner?.pid} user=${lock.owner?.user} (started ${lock.owner?.started_at})`, EXIT.LOCKED, { json: g.json });
+  rejectIfReadOnly('sync');
+  const limit = g.limit || '30';
+  const report = { ok: true, notifications: 0, groups: 0, chats: 0, errors: [], account: _account };
+  const ts = nowIso();
+
+  function pull(name, opencliSub) {
+    const r = opencli(['facebook', opencliSub, '--limit', String(limit), '-f', 'json'], { json: true, timeout: 180000 });
+    if (r.status !== 0) { report.errors.push({ name, error: (r.stderr || r.stdout || 'failed').trim().slice(0, 300) }); return []; }
+    return asRows(tryParseJson(r.stdout));
+  }
+
+  try {
+    for (const row of pull('notifications', 'notifications')) {
+      const id = row.notif_id || row.Notif_id || row.url || `${row.text}-${row.time}`;
+      runSql(`INSERT INTO notifications(notif_id,unread,text,time,url,notif_type,account,synced_at) VALUES('${sqlEscape(id)}',${row.unread ? 1 : 0},'${sqlEscape(row.text)}','${sqlEscape(row.time)}','${sqlEscape(row.url)}','${sqlEscape(row.notif_type || row.Notif_type)}','${sqlEscape(_account)}','${ts}') ON CONFLICT(notif_id) DO UPDATE SET unread=excluded.unread, text=excluded.text, time=excluded.time, url=excluded.url, notif_type=excluded.notif_type, account=excluded.account, synced_at=excluded.synced_at;`);
+    }
+    report.notifications = Number(runSql(`SELECT COUNT(*) FROM notifications WHERE account='${sqlEscape(_account)}';`).trim() || 0);
+  } catch (e) { report.errors.push({ name: 'notifications', error: String(e.message || e) }); }
+  try {
+    for (const row of pull('groups', 'groups')) {
+      const url = row.url || row.Url || row.name;
+      runSql(`INSERT INTO groups(url,name,last_post,account,synced_at) VALUES('${sqlEscape(url)}','${sqlEscape(row.name)}','${sqlEscape(row.last_post || row.Last_post || '')}','${sqlEscape(_account)}','${ts}') ON CONFLICT(url) DO UPDATE SET name=excluded.name, last_post=excluded.last_post, account=excluded.account, synced_at=excluded.synced_at;`);
+    }
+    report.groups = Number(runSql(`SELECT COUNT(*) FROM groups WHERE account='${sqlEscape(_account)}';`).trim() || 0);
+  } catch (e) { report.errors.push({ name: 'groups', error: String(e.message || e) }); }
+  try {
+    for (const row of pull('chats', 'messages')) {
+      const tid = row.thread_id || row.threadId;
+      if (!tid) continue;
+      runSql(`INSERT INTO chats(thread_id,name,snippet,time,unread,url,account,synced_at) VALUES('${sqlEscape(tid)}','${sqlEscape(row.name)}','${sqlEscape(row.snippet)}','${sqlEscape(row.time)}',${row.unread ? 1 : 0},'${sqlEscape(row.url)}','${sqlEscape(_account)}','${ts}') ON CONFLICT(thread_id) DO UPDATE SET name=excluded.name, snippet=excluded.snippet, time=excluded.time, unread=excluded.unread, url=excluded.url, account=excluded.account, synced_at=excluded.synced_at;`);
+      if (Array.isArray(row.messages)) {
+        for (const m of row.messages) {
+          runSql(`INSERT INTO messages(thread_id,from_me,sender,text,time,account,synced_at) VALUES(?,?,?,?,?,?,?);`, [tid, m.from_me ? 1 : 0, m.sender || null, m.text || '', m.time || '', _account, ts]);
+        }
+      }
+    }
+    report.chats = Number(runSql(`SELECT COUNT(*) FROM chats WHERE account='${sqlEscape(_account)}';`).trim() || 0);
+  } catch (e) { report.errors.push({ name: 'chats', error: String(e.message || e) }); }
+  try {
+    const r = opencli(['facebook', 'whoami', '-f', 'json'], { json: true });
+    if (r.status === 0) { const me = tryParseJson(r.stdout); if (me) setMeta('whoami', JSON.stringify(me)); }
+  } catch { /* */ }
+  setMeta('last_sync', ts);
+  setMeta('last_sync_report', JSON.stringify(report));
+  report.ok = report.errors.length === 0;
+  report.store = DB_PATH;
+  report.synced_at = ts;
+  if (g.json) console.log(JSON.stringify(stamp(report, 'sync'), null, 2));
+  else {
+    console.log(`fb sync ${report.ok ? 'OK' : 'PARTIAL'}`);
+    console.log(`  notifications: ${report.notifications}`);
+    console.log(`  groups:        ${report.groups}`);
+    console.log(`  chats:         ${report.chats}`);
+    console.log(`  store:         ${DB_PATH}`);
+    if (report.errors.length) { console.log('  errors:'); for (const e of report.errors) console.log(`    - ${e.name}: ${e.error}`); }
+  }
+  process.exit(report.ok ? EXIT.OK : EXIT.OPENCLI_FAIL);
+}
+
+function cmdDb(g, args) {
+  ensureStore();
+  const sub = args[0];
+  const queryArgs = args.slice(1);
   const limit = Number(g.limit || 20);
   let sql;
-  if (sub === 'notifications') {
-    sql = `SELECT notif_id, unread, substr(text,1,120) AS text, time, notif_type FROM notifications ORDER BY synced_at DESC LIMIT ${limit};`;
-  } else if (sub === 'chats') {
-    sql = `SELECT thread_id, name, substr(snippet,1,80) AS snippet, time, unread FROM chats ORDER BY synced_at DESC LIMIT ${limit};`;
-  } else if (sub === 'groups') {
-    sql = `SELECT name, last_post, url FROM groups ORDER BY synced_at DESC LIMIT ${limit};`;
-  } else if (sub === 'search') {
+  if (sub === 'notifications') sql = `SELECT notif_id, unread, substr(text,1,120) AS text, time, notif_type FROM notifications WHERE account='${sqlEscape(_account)}' ORDER BY synced_at DESC LIMIT ${limit};`;
+  else if (sub === 'chats') sql = `SELECT thread_id, name, substr(snippet,1,80) AS snippet, time, unread FROM chats WHERE account='${sqlEscape(_account)}' ORDER BY synced_at DESC LIMIT ${limit};`;
+  else if (sub === 'groups') sql = `SELECT name, last_post, url FROM groups WHERE account='${sqlEscape(_account)}' ORDER BY synced_at DESC LIMIT ${limit};`;
+  else if (sub === 'messages') sql = `SELECT id, thread_id, CASE WHEN from_me=1 THEN 'me' ELSE sender END AS who, substr(text,1,200) AS text, time FROM messages WHERE account='${sqlEscape(_account)}' ORDER BY id DESC LIMIT ${limit};`;
+  else if (sub === 'search') {
     const q = queryArgs.join(' ').trim();
-    if (!q) {
-      console.error('Usage: fb db search <query>');
-      process.exit(2);
-    }
-    sql = `SELECT 'notif' AS kind, text AS body, url AS ref FROM notifications WHERE text LIKE '%${sqlEscape(q)}%'
-           UNION ALL
-           SELECT 'chat', name || ': ' || snippet, url FROM chats WHERE name LIKE '%${sqlEscape(q)}%' OR snippet LIKE '%${sqlEscape(q)}%'
-           UNION ALL
-           SELECT 'group', name, url FROM groups WHERE name LIKE '%${sqlEscape(q)}%'
-           LIMIT ${limit};`;
-  } else {
-    console.error('Usage: fb db notifications|chats|groups|search');
-    process.exit(2);
-  }
-  // JSON mode via sqlite
-  if (g.json) {
-    const out = runSql(`.mode json\n${sql}`);
-    console.log(out.trim() || '[]');
-    process.exit(0);
-  }
+    if (!q) die('Usage: fb db search <query>', EXIT.USAGE, { json: g.json });
+    sql = `SELECT 'notif' AS kind, text AS body, url AS ref FROM notifications WHERE text LIKE '%${sqlEscape(q)}%' AND account='${sqlEscape(_account)}' UNION ALL SELECT 'chat', name || ': ' || snippet, url FROM chats WHERE (name LIKE '%${sqlEscape(q)}%' OR snippet LIKE '%${sqlEscape(q)}%') AND account='${sqlEscape(_account)}' UNION ALL SELECT 'group', name, url FROM groups WHERE name LIKE '%${sqlEscape(q)}%' AND account='${sqlEscape(_account)}' LIMIT ${limit};`;
+  } else die('Usage: fb db notifications|chats|groups|messages|search', EXIT.USAGE, { json: g.json });
+  if (g.json) { const out = runSql(`.mode json\n${sql}`); console.log(out.trim() || '[]'); process.exit(EXIT.OK); }
   const out = runSql(`.mode column\n.headers on\n${sql}`);
   process.stdout.write(out.endsWith('\n') ? out : out + '\n');
-  process.exit(0);
+  process.exit(EXIT.OK);
 }
 
 function parseSendArgs(argv) {
-  let to = null;
-  let message = null;
-  const rest = [];
+  let to = null, message = null; const rest = [];
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--to' || a === '-t') to = argv[++i];
     else if (a === '--message' || a === '-m') message = argv[++i];
     else rest.push(a);
   }
-  // allow: fb send <to> <message...>
   if (!to && rest.length) to = rest.shift();
   if (!message && rest.length) message = rest.join(' ');
   return { to, message };
 }
 
-function main() {
-  const g = parseGlobalArgs(process.argv.slice(2));
-  if (g.version) {
-    console.log(VERSION);
-    process.exit(0);
-  }
-  if (g.help || g.rest.length === 0) {
-    usage();
-    process.exit(g.help ? 0 : 2);
-  }
+// ─── per-subcommand help ────────────────────────────────────────────────────
+function helpFor(sub) {
+  const help = (s) => s;
+  if (sub === 'version') return `fb version — print version, paths, CDP endpoint, account\n\n  ${PROGRAM} version [--json]`;
+  if (sub === 'completion') return `fb completion <bash|zsh|fish|pwsh> — emit shell completion script\n\n  eval "$(fb completion bash)"\n  fb completion zsh > _fb && fpath+=. && autoload -U _fb && compinit\n  fb completion fish | source\n  fb completion pwsh > completer.ps1`;
+  if (sub === 'docs') return `fb docs — print repo / docs URL`;
+  if (sub === 'accounts') return `fb accounts — manage named accounts\n\n  fb accounts list | add <name> | use <name> | rm <name>`;
+  if (sub === 'store') return `fb store — local SQLite store introspection\n\n  fb store info | prune [days] | reset | lock [wait]`;
+  if (sub === 'profile') return `fb profile — public profile lookup or own profile\n\n  fb profile <username> | set --display <name> | whoami`;
+  if (sub === 'messages') return `fb messages — local store queries (offline after sync)\n\n  fb messages list [chat] [since] | show <id> | search <query>`;
+  if (sub === 'sync') return `fb sync — pull notifications/groups/chats into the local SQLite store\n\n  fb sync [--limit N] [--timeout 5m]\n  Block writes with --read-only or FB_READONLY=1.`;
+  if (sub === 'send') return `fb send — send a Messenger message\n\n  fb send --to <thread_id|url> --message "text"\n  fb send <thread_id> "text"  # positional shorthand`;
+  if (sub === 'db') return `fb db — raw local-store queries\n\n  fb db notifications | chats | groups | messages [--limit N]\n  fb db search <query>`;
+  if (sub === 'daemon') return `fb daemon — opencli daemon manager (lightweight, no GUI mgmt)\n\n  fb daemon start | stop | restart | status\n  (No more wmctrl/xdotool/hide — just opencli)`;
+  if (sub === 'doctor') return `fb doctor — opencli + FB session + store diagnostics`;
+  if (sub === 'status') return `fb status — auth + cdp + store + last sync + FTS counts`;
+  if (sub === 'whoami') return `fb whoami — show the logged-in Facebook account (via opencli)`;
+  if (sub === 'auth' || sub === 'login') return `fb auth | login — visible login (foreground window, one-time)`;
+  if (sub === 'setup' || sub === 'connect' || sub === 'onboard') return `fb setup — guided one-time connect (extension install → FB login → done)`;
+  if (sub === 'home' || sub === 'feed') return `fb home | feed — home/feed timeline (live)`;
+  if (sub === 'notifications' || sub === 'notifs') return `fb notifications | notifs — list notifications (live)`;
+  if (sub === 'groups') return `fb groups — list groups (live)`;
+  if (sub === 'friends') return `fb friends — list friends (live)`;
+  if (sub === 'search') return `fb search <query> — top results (mixed, live)`;
+  if (sub === 'posts' || sub === 'search-posts') return `fb posts <query> [--limit N] — public post search (live)`;
+  if (sub === 'post' || sub === 'read-post') return `fb post <url|fbid> — deep-read one public post/photo/reel (live)`;
+  if (sub === 'research') return `fb research <query> [--limit N] — posts search + deep-read top N`;
+  if (sub === 'chats' || sub === 'inbox') return `fb chats | inbox — list Messenger chats (live)`;
+  if (sub === 'thread' || sub === 'read') return `fb thread <thread_id|url> [--limit N] — read one Messenger thread`;
+  if (sub === 'media' || sub === 'pull') return `fb media | pull <thread|post-url> [--out DIR] [--limit N] [--keep]`;
+  if (sub === 'open') return `fb open <path> — open a downloaded file with the system viewer`;
+  if (sub === 'keep') return `fb keep <file|thread> — move tmp file(s) to keep/`;
+  if (sub === 'purge') return `fb purge [thread|all] — delete tmp downloads`;
+  if (sub === 'add-friend') return `fb add-friend <username> — send a friend request`;
+  if (sub === 'join-group') return `fb join-group <group> — join a group`;
+  if (sub === 'events') return `fb events [--limit N] — list events (live)`;
+  if (sub === 'memories') return `fb memories [--limit N] — list memories (live)`;
+  if (sub === 'marketplace') return `fb marketplace listings|inbox [--limit N] — Marketplace queries (live)`;
+  return null;
+}
 
+const HELP = {
+  default: () => `${PROGRAM} ${VERSION} — Facebook/Messenger CLI (opencli-backed, wacli/bird-shaped, lightweight)
+
+Usage:
+  ${PROGRAM} <command> [args] [options]
+
+Architecture (v0.7.0):
+  • Uses whatever opencli Chrome is on :9222 (or :9223 with FB_CHROME_ENDPOINT).
+  • No fb-managed Chrome, no wmctrl/xdotool, no hide dance, no systemd timer.
+  • For zero visible UI:  fb-headless start  (uses a dedicated profile on :9223)
+  • For one-time visible login:  fb auth
+
+Global flags (anywhere, before or after the subcommand):
+  --json, -j        JSON output (every command)
+  --events          NDJSON lifecycle events on stderr
+  --read-only       Refuse commands that write to Facebook or the local store
+  --plain           TSV output
+  --full            Disable table truncation
+  --no-color        Disable ANSI colors (also: NO_COLOR=1, FB_NO_COLOR=1)
+  --account NAME    Switch to a named account (default, work, …)
+  --store DIR       Override the store directory
+  --timeout DUR     Per-command timeout (Go duration: 30s, 5m, …)
+  --limit, -n N     Limit rows
+  --window MODE     opencli window: background (default) | foreground
+  -h, --help        Show help
+  -V, --version     Show version
+
+Setup:
+  ${PROGRAM} setup                              Guided connect (extension + login)
+  ${PROGRAM} auth | login                       Visible login (foreground, one-time)
+
+Daemon (now just wraps opencli):
+  ${PROGRAM} daemon start|stop|restart          opencli daemon
+  ${PROGRAM} daemon status                      CDP + auth check
+
+Auth / health:
+  ${PROGRAM} whoami                             Logged-in account
+  ${PROGRAM} status | check                     CDP + auth + store + last sync
+  ${PROGRAM} doctor                             opencli + FB session + store
+  ${PROGRAM} version                            ${PROGRAM} + paths + CDP
+  ${PROGRAM} completion <bash|zsh|fish|pwsh>    Shell completion
+  ${PROGRAM} docs                               Repo / docs URL
+
+Sync (writes to local SQLite, FTS5 indexed):
+  ${PROGRAM} sync [--limit N]                   Pull notifications/groups/chats
+
+Read (live via Chrome session):
+  ${PROGRAM} home | feed [--limit N]
+  ${PROGRAM} notifications | notifs [--limit N]
+  ${PROGRAM} groups [--limit N]
+  ${PROGRAM} friends [--limit N]
+  ${PROGRAM} search <query>
+  ${PROGRAM} posts | search-posts <query> [--limit N]
+  ${PROGRAM} post | read-post <url|fbid>
+  ${PROGRAM} research <query> [--limit N]
+  ${PROGRAM} profile <username> | set | whoami
+
+Messenger (live):
+  ${PROGRAM} chats | messages | inbox [--limit N]
+  ${PROGRAM} thread | read <thread_id|url> [--limit N]
+  ${PROGRAM} media | pull <thread|post-url> [--out DIR] [--limit N] [--keep]
+  ${PROGRAM} open <path>
+  ${PROGRAM} keep <file|thread>
+  ${PROGRAM} purge [thread|all]
+
+Write (refused in --read-only):
+  ${PROGRAM} send --to <thread_id|url> --message "..."
+  ${PROGRAM} add-friend <username>
+  ${PROGRAM} join-group <group>
+
+Local store (offline after sync):
+  ${PROGRAM} messages list [chat] [since]
+  ${PROGRAM} messages show <id>
+  ${PROGRAM} messages search <query>
+  ${PROGRAM} events [--limit N]
+  ${PROGRAM} memories [--limit N]
+  ${PROGRAM} marketplace listings|inbox [--limit N]
+  ${PROGRAM} accounts list|add|use|rm <name>
+  ${PROGRAM} store info|prune|reset|lock
+  ${PROGRAM} db notifications|chats|groups|messages|search <query>
+
+Misc:
+  ${PROGRAM} help [subcommand]                   Per-subcommand help
+  ${PROGRAM} docs
+
+Environment:
+  OPENCLI_BIN         Path to opencli
+  FB_CHROME_ENDPOINT  CDP endpoint override (default: auto-discover)
+  FB_STORE_DIR        Store directory (default: ~/.local/state/fb)
+  FB_CONFIG           Config file (default: ~/.config/fb/config.json5)
+  FB_ACCOUNT          Default account name
+  FB_READONLY         1 to force read-only
+  OPENCLI_WINDOW      background (default) | foreground
+  OPENCLI_CDP_ENDPOINT  opencli-native (used if FB_CHROME_ENDPOINT is unset)
+  NO_COLOR            Disable ANSI colors
+
+Config (JSON5, comments ok):
+  ${CONFIG_PATH}    — { "account": "work", "store": "/srv/fb", "readOnly": true }
+
+Notes:
+  • v0.7.0 dropped: wmctrl/xdotool, fb-hide.timer, fb-chrome-lean, fb-service.
+  • All exit codes are deterministic: 0=ok, 2=usage, 3=not-authed, 4=not-found, 5=read-only, 6=locked, 7=opencli-fail.
+  • For zero-UI mode:  fb-headless start  →  FB_CHROME_ENDPOINT=http://127.0.0.1:9223 fb whoami
+`,
+};
+
+// ════════════════════════════════════════════════════════════════════════════
+// DISPATCHER
+// ════════════════════════════════════════════════════════════════════════════
+function main() {
+  _t0 = Date.now();
+  const g = parseArgs(process.argv.slice(2));
+  _jsonActive = g.json;
+  _eventsOn = g.events;
+  _readOnlyActive = g.readOnly;
+  process.env.FB_ACCOUNT = g.account;
+
+  if (g.store) process.env.FB_STORE_DIR = g.store;
+  const realStoreDir = g.store || process.env.FB_STORE_DIR || DEFAULT_STORE;
+  if (realStoreDir !== STORE_DIR) { /* env already updated above */ }
+
+  emitEvent('cli.start', { version: VERSION, argv: process.argv.slice(2) });
+  if (g.version) { cmdVersion(g); return; }
+  if (g.help && g.rest.length === 0) { console.log(HELP.default()); process.exit(EXIT.OK); }
+  if (g.rest.length === 0) { console.log(HELP.default()); process.exit(EXIT.USAGE); }
   const [cmd, ...args] = g.rest;
+  if (g.help) {
+    const h = helpFor(cmd);
+    if (h) { console.log(h); process.exit(EXIT.OK); }
+    console.log(HELP.default()); process.exit(EXIT.OK);
+  }
 
   switch (cmd) {
-    case 'setup':
-    case 'connect':
-    case 'onboard':
-      cmdSetup(g);
+    case 'setup': case 'connect': case 'onboard': cmdSetup(g); break;
+    case 'daemon': cmdDaemon(g, args); break;
+    case 'auth': case 'login':
+      console.error('fb auth: using visible browser for login (one-time). After success, fb stays invisible.');
+      rejectIfReadOnly('login (auth)');
+      printRaw(opencli(['facebook', 'login', '--window', 'foreground'], { json: false, timeout: 600000, windowMode: 'foreground' }), { json: g.json });
       break;
-    case 'daemon':
-      cmdDaemon(args[0], g);
-      break;
-    case 'auth':
-    case 'login':
-      // Login must be visible once so you can type password / 2FA / approve.
-      console.error('fb auth: using visible browser for login (one-time). After success, backend stays invisible.');
-      printRaw(
-        opencli(['facebook', 'login', '--window', 'foreground'], {
-          json: false,
-          timeout: 600000,
-          windowMode: 'foreground',
-        }),
-        g,
-      );
-      // re-hide after login attempt
-      hideChromeWindows();
-      break;
-    case 'whoami':
-      runFacebook('whoami', [], g);
-      break;
-    case 'status':
-    case 'check':
-      cmdStatus(g);
-      break;
-    case 'doctor':
-      cmdDoctor(g);
-      break;
-    case 'sync':
-      cmdSync(g);
-      break;
-    case 'home':
-    case 'feed':
-      runFacebook('feed', [], g);
-      break;
-    case 'notifications':
-    case 'notifs':
-      runFacebook('notifications', [], g);
-      break;
-    case 'groups':
-      runFacebook('groups', [], g);
-      break;
-    case 'friends':
-      runFacebook('friends', [], g);
-      break;
+    case 'whoami': runFacebook('whoami', [], g); break;
+    case 'status': case 'check': cmdStatus(g); break;
+    case 'doctor': cmdDoctor(g); break;
+    case 'version': cmdVersion(g); break;
+    case 'completion': cmdCompletion(g, args); break;
+    case 'accounts': cmdAccounts(g, args); break;
+    case 'store': cmdStore(g, args); break;
+    case 'docs': cmdDocs(g); break;
+    case 'profile': cmdProfile(g, args); break;
+    case 'sync': cmdSync(g); break;
+    case 'home': case 'feed': runFacebook('feed', [], g); break;
+    case 'notifications': case 'notifs': runFacebook('notifications', [], g); break;
+    case 'groups': runFacebook('groups', [], g); break;
+    case 'friends': runFacebook('friends', [], g); break;
     case 'search':
-      if (!args[0]) {
-        console.error('Usage: fb search <query>');
-        process.exit(2);
-      }
-      runFacebook('search', [args.join(' ')], g);
-      break;
-    case 'posts':
-    case 'search-posts':
-      if (!args[0]) {
-        console.error('Usage: fb posts <query>');
-        process.exit(2);
-      }
-      runFacebook('search-posts', [args.join(' ')], g);
-      break;
-    case 'post':
-    case 'read-post':
-      if (!args[0]) {
-        console.error('Usage: fb post <url|fbid>');
-        process.exit(2);
-      }
-      runFacebook('post', [args[0]], g);
-      break;
+      if (!args[0]) die('Usage: fb search <query>', EXIT.USAGE, { json: g.json });
+      runFacebook('search', [args.join(' ')], g); break;
+    case 'posts': case 'search-posts':
+      if (!args[0]) die('Usage: fb posts <query>', EXIT.USAGE, { json: g.json });
+      runFacebook('search-posts', [args.join(' ')], g); break;
+    case 'post': case 'read-post':
+      if (!args[0]) die('Usage: fb post <url|fbid>', EXIT.USAGE, { json: g.json });
+      runFacebook('post', [args[0]], g); break;
     case 'research': {
-      if (!args[0]) {
-        console.error('Usage: fb research <query> [--limit N]');
-        process.exit(2);
-      }
+      if (!args[0]) die('Usage: fb research <query> [--limit N]', EXIT.USAGE, { json: g.json });
       const q = args.join(' ');
       const lim = Number(g.limit || 5);
-      const search = opencli(
-        ['facebook', 'search-posts', q, '--limit', String(lim), '-f', 'json'],
-        { json: true, timeout: 180000, windowMode: effectiveWindow(g) },
-      );
-      if (search.status !== 0) {
-        printRaw(search, g);
-        break;
-      }
+      const search = opencli(['facebook', 'search-posts', q, '--limit', String(lim), '-f', 'json'], { json: true, timeout: 180000, windowMode: effectiveWindow(g) });
+      if (search.status !== 0) { printRaw(search, { json: g.json }); break; }
       const hits = asRows(tryParseJson(search.stdout));
-      const report = { query: q, count: hits.length, posts: [] };
+      const report = stamp({ query: q, count: hits.length, posts: [] }, 'research');
       for (const hit of hits.slice(0, lim)) {
         const url = hit.url || hit.Url;
-        const entry = {
-          search: hit,
-          detail: null,
-          error: null,
-        };
+        const entry = { search: hit, detail: null, error: null };
         if (url) {
-          const deep = opencli(['facebook', 'post', url, '-f', 'json'], {
-            json: true,
-            timeout: 120000,
-            windowMode: effectiveWindow(g),
-          });
-          if (deep.status === 0) {
-            const rows = asRows(tryParseJson(deep.stdout));
-            entry.detail = rows[0] || null;
-          } else {
-            entry.error = (deep.stderr || deep.stdout || 'deep-read failed').trim().slice(0, 240);
-          }
-        } else {
-          entry.error = 'no public url in search hit';
-        }
+          const deep = opencli(['facebook', 'post', url, '-f', 'json'], { json: true, timeout: 120000, windowMode: effectiveWindow(g) });
+          if (deep.status === 0) { const rows = asRows(tryParseJson(deep.stdout)); entry.detail = rows[0] || null; }
+          else entry.error = (deep.stderr || deep.stdout || 'deep-read failed').trim().slice(0, 240);
+        } else entry.error = 'no public url in search hit';
         report.posts.push(entry);
       }
-      if (g.json) {
-        console.log(JSON.stringify(report, null, 2));
-      } else {
+      if (g.json) console.log(JSON.stringify(report, null, 2));
+      else {
         console.log(`fb research: ${q}`);
         console.log(`hits: ${report.count}\n`);
         report.posts.forEach((p, i) => {
-          const s = p.search || {};
-          const d = p.detail || {};
+          const s = p.search || {}; const d = p.detail || {};
           console.log(`── ${i + 1}. ${d.author || s.author || '(unknown)'}  [${d.kind || s.kind || ''}]`);
           console.log(`url: ${d.url || s.url || ''}`);
           const body = d.text || s.summary || '';
           console.log(body.slice(0, 420) + (body.length > 420 ? '…' : ''));
-          if (d.likes || d.loves || d.reactions) {
-            console.log(
-              `reactions: likes=${d.likes || '-'} loves=${d.loves || '-'} other=${d.reactions || '-'} comments=${d.comments_count || '-'}`,
-            );
-          }
+          if (d.likes || d.loves || d.reactions) console.log(`reactions: likes=${d.likes || '-'} loves=${d.loves || '-'} other=${d.reactions || '-'} comments=${d.comments_count || '-'}`);
           if (d.links) console.log(`links: ${String(d.links).slice(0, 200)}`);
           if (p.error) console.log(`note: ${p.error}`);
           console.log('');
         });
       }
-      process.exit(0);
-      break;
+      process.exit(EXIT.OK);
     }
-    case 'profile':
-      if (!args[0]) {
-        console.error('Usage: fb profile <username>');
-        process.exit(2);
-      }
-      runFacebook('profile', [args[0]], g);
-      break;
-    case 'chats':
-    case 'messages':
-    case 'inbox':
-      runFacebook('messages', [], g);
-      break;
-    case 'thread':
-    case 'read':
-      if (!args[0]) {
-        console.error('Usage: fb thread <thread_id|url>');
-        process.exit(2);
-      }
-      runFacebook('thread', [args[0]], g);
-      break;
-    case 'media':
-    case 'pull':
-    case 'download-media':
-    case 'media-download': {
-      if (!args[0]) {
-        console.error('Usage: fb pull <thread_id|url> [--out DIR] [--limit N] [--keep]');
-        process.exit(2);
-      }
+    case 'chats': case 'inbox':
+      runFacebook('messages', [], g); break;
+    case 'messages': cmdMessages(g, args); break;
+    case 'thread': case 'read':
+      if (!args[0]) die('Usage: fb thread <thread_id|url>', EXIT.USAGE, { json: g.json });
+      runFacebook('thread', [args[0]], g); break;
+    case 'media': case 'pull': case 'download-media': case 'media-download': {
+      if (!args[0]) die('Usage: fb pull <thread_id|url> [--out DIR] [--limit N] [--keep]', EXIT.USAGE, { json: g.json });
       const mediaExtra = [args[0]];
       for (let i = 1; i < args.length; i += 1) {
         if (args[i] === '--out' && args[i + 1]) mediaExtra.push('--out', args[++i]);
         else if (args[i] === '--keep') mediaExtra.push('--keep', 'true');
-        else if (args[i] === '--limit' && args[i + 1]) {
-          // also set global limit for opencli
-          g.limit = args[++i];
-        }
+        else if (args[i] === '--limit' && args[i + 1]) g.limit = args[++i];
       }
       runFacebook('media-download', mediaExtra, g);
       break;
     }
     case 'open': {
       const p = args[0];
-      if (!p) {
-        console.error('Usage: fb open <path>');
-        process.exit(2);
-      }
+      if (!p) die('Usage: fb open <path>', EXIT.USAGE, { json: g.json });
       const target = path.resolve(p);
-      if (!fs.existsSync(target)) {
-        console.error(`Not found: ${target}`);
-        process.exit(1);
-      }
-      // Fully detach GUI viewer so the CLI never hangs on xdg-open
-      const bin =
-        process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'cmd' : 'xdg-open';
-      const argv =
-        process.platform === 'win32' ? ['/c', 'start', '', target] : [target];
-      const child = spawn(bin, argv, {
-        detached: true,
-        stdio: 'ignore',
-      });
+      if (!fs.existsSync(target)) die(`Not found: ${target}`, EXIT.NOT_FOUND, { json: g.json });
+      const bin = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'cmd' : 'xdg-open';
+      const argv = process.platform === 'win32' ? ['/c', 'start', '', target] : [target];
+      const child = spawn(bin, argv, { detached: true, stdio: 'ignore' });
       child.unref();
       console.log(`opened: ${target}`);
-      process.exit(0);
-      break;
+      process.exit(EXIT.OK);
     }
     case 'keep': {
       ensureStore();
       const src = args[0];
-      if (!src) {
-        console.error('Usage: fb keep <file-or-thread-id>');
-        process.exit(2);
-      }
-      const store = process.env.FB_STORE_DIR || path.join(os.homedir(), '.local/state/fb');
-      const keepRoot = path.join(store, 'keep');
+      if (!src) die('Usage: fb keep <file-or-thread-id>', EXIT.USAGE, { json: g.json });
+      const keepRoot = path.join(STORE_DIR, 'keep');
       fs.mkdirSync(keepRoot, { recursive: true });
       let fromPath = path.resolve(src);
-      if (!fs.existsSync(fromPath)) {
-        // treat as thread id tmp folder
-        fromPath = path.join(store, 'tmp', src);
-      }
-      if (!fs.existsSync(fromPath)) {
-        console.error(`Not found: ${src}`);
-        process.exit(1);
-      }
+      if (!fs.existsSync(fromPath)) fromPath = path.join(STORE_DIR, 'tmp', src);
+      if (!fs.existsSync(fromPath)) die(`Not found: ${src}`, EXIT.NOT_FOUND, { json: g.json });
       const st = fs.statSync(fromPath);
       if (st.isDirectory()) {
         const dest = path.join(keepRoot, path.basename(fromPath));
@@ -1319,7 +1314,6 @@ function main() {
           if (name === 'manifest.json') continue;
           fs.renameSync(path.join(fromPath, name), path.join(dest, name));
         }
-        // copy manifest if present
         const man = path.join(fromPath, 'manifest.json');
         if (fs.existsSync(man)) fs.copyFileSync(man, path.join(dest, 'manifest.json'));
         console.log(`kept directory → ${dest}`);
@@ -1328,89 +1322,180 @@ function main() {
         fs.renameSync(fromPath, dest);
         console.log(`kept → ${dest}`);
       }
-      process.exit(0);
-      break;
+      process.exit(EXIT.OK);
     }
     case 'purge': {
-      const store = process.env.FB_STORE_DIR || path.join(os.homedir(), '.local/state/fb');
-      const tmpRoot = path.join(store, 'tmp');
       const target = args[0] || 'all';
-      if (!fs.existsSync(tmpRoot)) {
-        console.log('nothing to purge');
-        process.exit(0);
-      }
-      if (target === 'all') {
-        fs.rmSync(tmpRoot, { recursive: true, force: true });
-        fs.mkdirSync(tmpRoot, { recursive: true });
-        console.log(`purged all temp media under ${tmpRoot}`);
-      } else {
-        const dir = path.join(tmpRoot, target);
-        if (!fs.existsSync(dir)) {
-          console.error(`No tmp folder for thread: ${target}`);
-          process.exit(1);
-        }
+      if (!fs.existsSync(TMP_DIR)) { console.log('nothing to purge'); process.exit(EXIT.OK); }
+      if (target === 'all') { fs.rmSync(TMP_DIR, { recursive: true, force: true }); fs.mkdirSync(TMP_DIR, { recursive: true }); console.log(`purged all temp media under ${TMP_DIR}`); }
+      else {
+        const dir = path.join(TMP_DIR, target);
+        if (!fs.existsSync(dir)) die(`No tmp folder for thread: ${target}`, EXIT.NOT_FOUND, { json: g.json });
         fs.rmSync(dir, { recursive: true, force: true });
         console.log(`purged ${dir}`);
       }
-      process.exit(0);
-      break;
+      process.exit(EXIT.OK);
     }
     case 'send': {
       const { to, message } = parseSendArgs(args);
-      if (!to || !message) {
-        console.error('Usage: fb send --to <thread_id|url> --message "text"');
-        process.exit(2);
-      }
+      if (!to || !message) die('Usage: fb send --to <thread_id|url> --message "text"', EXIT.USAGE, { json: g.json });
+      rejectIfReadOnly('send message');
       runFacebook('send-message', ['--to', to, '--message', message], g);
       break;
     }
     case 'add-friend':
-      if (!args[0]) {
-        console.error('Usage: fb add-friend <username>');
-        process.exit(2);
-      }
-      runFacebook('add-friend', [args[0]], g);
-      break;
+      if (!args[0]) die('Usage: fb add-friend <username>', EXIT.USAGE, { json: g.json });
+      rejectIfReadOnly('add friend');
+      runFacebook('add-friend', [args[0]], g); break;
     case 'join-group':
-      if (!args[0]) {
-        console.error('Usage: fb join-group <group>');
-        process.exit(2);
-      }
-      runFacebook('join-group', [args[0]], g);
-      break;
-    case 'events':
-      runFacebook('events', [], g);
-      break;
-    case 'memories':
-      runFacebook('memories', [], g);
-      break;
+      if (!args[0]) die('Usage: fb join-group <group>', EXIT.USAGE, { json: g.json });
+      rejectIfReadOnly('join group');
+      runFacebook('join-group', [args[0]], g); break;
+    case 'events': runFacebook('events', [], g); break;
+    case 'memories': runFacebook('memories', [], g); break;
     case 'marketplace': {
       const sub = args[0];
       if (sub === 'listings' || sub === 'list') runFacebook('marketplace-listings', args.slice(1), g);
       else if (sub === 'inbox') runFacebook('marketplace-inbox', args.slice(1), g);
-      else {
-        console.error('Usage: fb marketplace listings|inbox');
-        process.exit(2);
-      }
+      else die('Usage: fb marketplace listings|inbox', EXIT.USAGE, { json: g.json });
       break;
     }
-    case 'db':
-      cmdDb(args[0], args.slice(1), g);
-      break;
+    case 'db': cmdDb(g, args); break;
     case 'help':
-      usage();
-      process.exit(0);
-      break;
+      if (args[0]) {
+        const h = helpFor(args[0]);
+        if (h) { console.log(h); process.exit(EXIT.OK); }
+        die(`no help for: ${args[0]}`, EXIT.USAGE, { json: g.json });
+      }
+      console.log(HELP.default());
+      process.exit(EXIT.OK);
     default:
       console.error(`Unknown command: ${cmd}\n`);
-      usage();
-      process.exit(2);
+      console.log(HELP.default());
+      process.exit(EXIT.USAGE);
   }
 }
 
+let _account = 'default';
+function mainWrapper() {
+  const g = parseArgs(process.argv.slice(2));
+  _account = g.account || 'default';
+  _jsonActive = g.json;
+  _eventsOn = g.events;
+  _readOnlyActive = g.readOnly;
+  return main();
+}
+
+function cmdSetup(g) {
+  // Non-interactive mode: print what the human needs to do, but don't open
+  // any URLs and don't poll. Useful for CI, agents, headless servers.
+  if (process.env.FB_SETUP_NONINTERACTIVE === '1') {
+    console.log('fb setup (non-interactive)');
+    console.log('');
+    console.log('Open these URLs in Chrome, then re-run without FB_SETUP_NONINTERACTIVE=1:');
+    console.log('  1. Install OpenCLI extension:');
+    console.log(`     ${process.env.FB_OPENCLI_EXT_URL || 'https://chromewebstore.google.com/detail/opencli/ildkmabpimmkaediidaifkhjpohdnifk'}`);
+    console.log('  2. Log into Facebook:');
+    console.log('     https://www.facebook.com/login');
+    console.log('');
+    process.exit(EXIT.OK);
+  }
+  const timeoutMs = Number(process.env.FB_SETUP_TIMEOUT_MS || 10 * 60 * 1000);
+  const pollMs = Number(process.env.FB_SETUP_POLL_MS || 4000);
+  const started = Date.now();
+  console.log('');
+  console.log('╔══════════════════════════════════════════════════════╗');
+  console.log('║  fb setup — connect once, then everything is magic  ║');
+  console.log('╚══════════════════════════════════════════════════════╝');
+  console.log('');
+  console.log('You only need to click a few things in Chrome.');
+  console.log('I will open the right tabs and wait.');
+  console.log('');
+
+  // open-url: xdg-open on Linux, open on macOS, never fail loud
+  function openUrl(url) {
+    const opener = process.env.FB_OPEN_CMD || (process.platform === 'darwin' ? 'open' : 'xdg-open');
+    try {
+      const child = spawn(opener, [url], { detached: true, stdio: 'ignore' });
+      child.unref();
+      return true;
+    } catch { return false; }
+  }
+
+  spawnSync(OPENCLI, ['daemon', 'restart'], { encoding: 'utf8', timeout: 30000 });
+  sleepMs(1500);
+
+  let d = doctorConnected();
+  if (d.ok) console.log('✓ OpenCLI extension already connected');
+  else {
+    console.log('Step 1/2 — Install OpenCLI extension');
+    console.log('  → Opening Chrome Web Store…');
+    console.log('  → Click  "Add to Chrome"  /  "Install"  in the tab that opens');
+    const url = process.env.FB_OPENCLI_EXT_URL || 'https://chromewebstore.google.com/detail/opencli/ildkmabpimmkaediidaifkhjpohdnifk';
+    console.log(`  → ${url}`);
+    console.log('');
+    if (!openUrl(url)) {
+      console.log(`  ! Could not open browser automatically. Open this URL manually:`);
+      console.log(`    ${url}`);
+    }
+    process.stdout.write('  Waiting for extension');
+    while (Date.now() - started < timeoutMs) {
+      d = doctorConnected();
+      if (d.ok) { console.log(''); console.log('✓ Extension connected'); break; }
+      process.stdout.write('.'); sleepMs(pollMs);
+    }
+    if (!d.ok) { console.log(''); console.error('✗ Timed out waiting for OpenCLI extension.'); process.exit(EXIT.INTERNAL); }
+  }
+
+  let auth = facebookLoggedIn();
+  if (auth.ok) console.log(`✓ Facebook already logged in (user_id=${auth.me.user_id || '?'})`);
+  else {
+    console.log('');
+    console.log('Step 2/2 — Log into Facebook');
+    console.log('  → Opening Facebook login…');
+    console.log('  → Sign in / complete 2FA in the browser tab');
+    console.log('');
+    if (!openUrl('https://www.facebook.com/login')) {
+      console.log('  ! Could not open browser. Open https://www.facebook.com/login manually.');
+    }
+    spawn(OPENCLI, ['facebook', 'login', '--window', 'foreground'], { detached: true, stdio: 'ignore', env: { ...process.env, OPENCLI_WINDOW: 'foreground' } }).unref();
+    process.stdout.write('  Waiting for Facebook session');
+    while (Date.now() - started < timeoutMs) {
+      auth = facebookLoggedIn();
+      if (auth.ok) { console.log(''); console.log(`✓ Logged in (user_id=${auth.me.user_id || '?'})`); break; }
+      process.stdout.write('.'); sleepMs(pollMs);
+    }
+    if (!auth.ok) { console.log(''); console.error('✗ Timed out waiting for Facebook login.'); process.exit(EXIT.INTERNAL); }
+  }
+
+  if (auth.me?.user_id) {
+    const ts = nowIso();
+    const display = auth.me.name || auth.me.display_name || null;
+    runSql(
+      `INSERT INTO accounts(name,user_id,display_name,last_used_at,created_at) VALUES('default','${sqlEscape(auth.me.user_id)}', ${display ? `'${sqlEscape(display)}'` : 'NULL'}, '${ts}', '${ts}') ON CONFLICT(name) DO UPDATE SET user_id=excluded.user_id, display_name=COALESCE(excluded.display_name, accounts.display_name), last_used_at=excluded.last_used_at;`,
+    );
+  }
+  setMeta('last_setup', nowIso());
+
+  console.log('');
+  console.log('══════════════════════════════════════════════════════');
+  console.log('  All set. Rest is magic.');
+  console.log('');
+  console.log('  Try:');
+  console.log('    fb whoami');
+  console.log('    fb chats --limit 10');
+  console.log('    fb posts "something" --limit 5');
+  console.log('══════════════════════════════════════════════════════');
+  console.log('');
+
+  if (g.json) console.log(JSON.stringify(stamp({ ok: true, extension: true, authenticated: true, user_id: auth.me?.user_id || null }, 'setup'), null, 2));
+  process.exit(EXIT.OK);
+}
+
 try {
-  main();
+  mainWrapper();
 } catch (err) {
   console.error(`fb error: ${err instanceof Error ? err.message : err}`);
-  process.exit(1);
+  emitEvent('cli.error', { message: String(err?.message || err) });
+  process.exit(EXIT.INTERNAL);
 }
