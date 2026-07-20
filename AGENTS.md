@@ -28,7 +28,6 @@ Chrome **blocks silent Web Store installs**. The human must click **Add to Chrom
 2. Polls until the extension connects  
 3. Opens Facebook login  
 4. Polls until `fb whoami` succeeds  
-5. Optionally enables systemd units  
 
 Tell the human: **"Click Add to Chrome / Install when the store tab opens, then log into Facebook if asked. I'll wait."**
 
@@ -46,19 +45,32 @@ fb research "query" --limit 3
 
 Always prefer `--json` when parsing.
 
+## Optional: headless mode (no visible Chrome)
+
+If the user doesn't want a Chrome window open, or is on a headless server:
+
+```bash
+fb-headless start
+fb whoami
+fb-headless stop     # when done
+```
+
+`fb-headless` launches a dedicated headless Chrome with a minimal profile (just the OpenCLI extension and facebook.com cookies — everything else is purged on first run). `fb` will prefer the headless Chrome on :9223 if it's running, falling back to the user's visible Chrome on :9222.
+
 ## Architecture constraints
 
-- Not headless-CDP primary; uses **OpenCLI extension bridge**  
-- Auth = Chrome cookies for facebook.com  
-- Backend windows default to **background** (invisible)  
-- Public / visible content only  
+- v0.7.0+: headless-by-default; no wmctrl, no xdotool, no window-hide systemd units
+- Auth = Chrome cookies for facebook.com (copied into the headless profile on first start)
+- Backend can run with **zero visible UI** via `fb-headless start`
+- Public / visible content only
 
 ## Health checks
 
 ```bash
-opencli doctor     # extension + daemon
-fb daemon status   # auth + bridge
-fb whoami
+opencli doctor                 # extension + daemon
+fb version                     # bridge status (daemon + chrome + extension)
+fb whoami                      # facebook session
+fb-headless status             # headless Chrome
 ```
 
 ## Do not

@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+# fb-headless — manages a dedicated headless Chrome for fb on :9223.
+#
+# Why its own user-data-dir? Because Chrome's SingletonLock prevents
+# running a second instance against the same profile. The visible Chrome
+# (on ~/.config/google-chrome/Default) is the user's normal browser; the
+# headless Chrome here lives in its own user-data-dir with a copy of the
+# Default profile and runs in parallel without conflict.
+#
+# What lives in the headless profile:
+#   - All extensions copied from the source profile (OpenCLI included)
+#   - All cookies (facebook.com c_user/xs/fr/datr, plus everything else)
+#   - Login data, preferences, Local Storage — all copied once
+#
+# What does NOT live here:
+#   - Active tabs, open windows (those are runtime state)
+#   - Anything new the user does in the visible browser (we don't sync
+#     changes back; headless profile is frozen at first-start)
+#
+# Usage:
+#   fb-headless start         Start (or adopt existing) headless Chrome
+#   fb-headless stop          Kill it
+#   fb-headless restart       Stop + start
+#   fb-headless status        Health check (port, CDP, RSS, pid)
+#   fb-headless logs [N]      Last N lines of the log (default 40)
+#   fb-headless reset         Delete the headless profile (forces re-copy on next start)
+#
+# Environment:
+#   FB_CHROME_PORT                  CDP port (default 9223)
+#   FB_HEADLESS_USER_DATA           Headless user-data-dir (default ~/.local/state/fb/chrome)
+#   FB_HEADLESS_PROFILE_DIR         Profile name inside user-data-dir (default Default)
+#   FB_SOURCE_PROFILE               Source profile dir to copy (default ~/.config/google-chrome/Default)
+#   FB_CHROME_BIN                   Chrome binary (default /usr/bin/google-chrome)
+#   FB_CHROME_LOG                   Log path (default ~/.local/state/fb/chrome.log)
+
+set -euo pipefail
+
+PORT="${FB_CHROME_PORT:-9223}"
+HEADLESS_USER_DATA="${FB_HEADLESS_USER_DATA:-$HOME/.local/state/fb/chrome}"
+HEADLESS_PROFILE_DIR="${FB_HEADLESS_PROFILE_DIR:-Default}"
+# Source is a single profile directory (e.g. ~/.config/google-chrome/Default)
+SOURCE_PROFILE="${FB_SOURCE_PROFILE:-$HOME/.config/google-chrome/Default}"
+# Locate Chrome: $PATH first, then common install locations
+find_chrome() {
+  # 1. explicit override
+  if [ -n "${FB_CHROME_BIN:-}" ] && [ -x "$FB_CHROME_BIN" ]; then
+    echo "$FB_CHROME_BIN"; return 0
+  fi
+  # 2. anything on $PATH that looks like Chrome
+  for name in google-chrome google-chrome-stable chromium chromium-browser chrome; do
+    if command -v "$name" >/dev/null 2>&1; then
+      command -v "$name"; return 0
+    fi
+  done
+  # 3. common install paths
+  for c in \
+    /usr/bin/google-chrome \
+    /usr/bin/google-chrome-stable \
+    /usr/bin/chromium \
+    /usr/bin/chromium-browser \
+    /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+    /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+    /snap/bin/chromium \
+    /opt/google/chrome/chrome \
+    "$HOME/.cache/ms-playwright/chromium-*/chrome-linux/chrome"
+  do
+    # shellcheck disable=SC2086
+    [ -x "$c" ] && { echo "$c"; return 0; }
+  done
+  return 1
+}
+CHROME="$(find_chrome 2>/dev/null || true)"
+[ -z "$CHROME" ] && CHROME="/usr/bin/google-chrome"  # best-guess fallback; will error loudly at start
+LOG="${FB_CHROME_LOG:-$HOME/.local/state/fb/chrome.log}"
+PIDFILE="$HOME/.local/state/fb/chrome.pid"
+# HEADLESS_PROFILE is the per-profile subdir inside the user-data-dir
+HEADLESS_PROFILE="$HEADLESS_USER_DATA/$HEADLESS_PROFILE_DIR"
+
+log() { echo "[fb-headless] $*" >&2; }
+die() { echo "fb-headless: $*" >&2; exit "${2:-1}"; }
+
+probe_cdp() {
+  curl -s --max-time 2 "http://127.0.0.1:$PORT/json/version" >/dev/null 2>&1
+}
+
+chrome_pids_for_port() {
+  for pid in $(pgrep -x chrome 2>/dev/null) $(pgrep -x google-chrome 2>/dev/null) $(pgrep -x google-chrome-stable 2>/dev/null); do
+    [ -r "/proc/$pid/cmdline" ] || continue
+    local cmdline
+    cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
+    if printf '%s' "$cmdline" | grep -qE "(^| )--remote-debugging-port=${PORT}( |$)"; then
+      echo "$pid"
+    fi
+  done
+}
+
+# Copy source profile → headless profile.
+# Skips: runtime locks, the cache (will rebuild), the GrShaderCache (large + rebuildable).
+# Keeps: Cookies, Extensions, Login Data, Preferences, Local Storage, etc.
+# Copy ONLY the minimum needed for fb to work headless:
+#   - The OpenCLI extension (so the bridge can connect)
+#   - The Cookies SQLite (Facebook auth = c_user/xs/fr/datr) — encrypted by Chrome
+#   - Local State + Preferences (contain the encryption key to decrypt cookies)
+#   - Login Data (for the Google account attached to Chrome — needed for some flows)
+# Skip: History, Bookmarks, Cache, Code Cache, Service Worker, IndexedDB, all
+#       other extensions, all other cookies (we'll purge non-fb cookies after).
+# Result: ~1-5 MB profile instead of 467 MB.
+copy_profile() {
+  if [ ! -d "$SOURCE_PROFILE" ]; then
+    die "source profile not found: $SOURCE_PROFILE (Chrome installed?)" 1
+  fi
+  if [ -d "$HEADLESS_PROFILE" ] && [ -f "$HEADLESS_PROFILE/Cookies" ] && [ -f "$HEADLESS_PROFILE/Preferences" ]; then
+    return 0  # already done
+  fi
+  log "first start: minimal copy from $SOURCE_PROFILE → $HEADLESS_PROFILE"
+  mkdir -p "$HEADLESS_PROFILE"
+
+  # 1. OpenCLI extension (the only extension we want)
+  if [ -d "$SOURCE_PROFILE/Extensions/ildkmabpimmkaediidaifkhjpohdnifk" ]; then
+    mkdir -p "$HEADLESS_PROFILE/Extensions"
+    cp -r "$SOURCE_PROFILE/Extensions/ildkmabpimmkaediidaifkhjpohdnifk" "$HEADLESS_PROFILE/Extensions/"
+    log "  + opencli extension ($(du -sk "$HEADLESS_PROFILE/Extensions/ildkmabpimmkaediidaifkhjpohdnifk" | awk '{print $1}')KB)"
+  else
+    log "  ! WARNING: opencli extension not found in source — bridge won't connect"
+  fi
+
+  # 2. Cookies (with all encrypted values — decryption needs Local State below)
+  if [ -f "$SOURCE_PROFILE/Cookies" ]; then
+    cp "$SOURCE_PROFILE/Cookies" "$HEADLESS_PROFILE/Cookies"
+    log "  + Cookies"
+  fi
+
+  # 3. Login Data (account state — some flows check this)
+  if [ -f "$SOURCE_PROFILE/Login Data" ]; then
+    cp "$SOURCE_PROFILE/Login Data" "$HEADLESS_PROFILE/Login Data"
+    log "  + Login Data"
+  fi
+
+  # 4. Safe Browsing Cookies
+  if [ -f "$SOURCE_PROFILE/Safe Browsing Cookies" ]; then
+    cp "$SOURCE_PROFILE/Safe Browsing Cookies" "$HEADLESS_PROFILE/Safe Browsing Cookies"
+  fi
+
+  # 5. Preferences (extension state + per-profile settings)
+  if [ -f "$SOURCE_PROFILE/Preferences" ]; then
+    cp "$SOURCE_PROFILE/Preferences" "$HEADLESS_PROFILE/Preferences"
+    log "  + Preferences ($(du -sk "$HEADLESS_PROFILE/Preferences" | awk '{print $1}')KB)"
+  fi
+  if [ -f "$SOURCE_PROFILE/Secure Preferences" ]; then
+    cp "$SOURCE_PROFILE/Secure Preferences" "$HEADLESS_PROFILE/Secure Preferences"
+  fi
+
+  # 6. Local State (at user-data-dir level) — CRITICAL: contains the OS-keyring
+  #    encryption key that decrypts the cookies above.
+  if [ -f "$SOURCE_PROFILE/../Local State" ]; then
+    cp "$SOURCE_PROFILE/../Local State" "$HEADLESS_USER_DATA/Local State"
+    log "  + Local State (user-data-dir)"
+  fi
+
+  # 7. First Run (suppresses "make Chrome default" prompts)
+  if [ -f "$SOURCE_PROFILE/../First Run" ]; then
+    cp "$SOURCE_PROFILE/../First Run" "$HEADLESS_USER_DATA/First Run"
+  fi
+
+  log "minimal profile copied"
+}
+
+cmd_start() {
+  mkdir -p "$(dirname "$LOG")" "$(dirname "$PIDFILE")" "$HEADLESS_USER_DATA"
+
+  # Already serving? adopt.
+  if probe_cdp; then
+    local pids
+    pids=$(chrome_pids_for_port | tr '\n' ' ')
+    log "headless Chrome already serving CDP on :$PORT (pids: ${pids:-none})"
+    echo "${pids%% *}" > "$PIDFILE" 2>/dev/null || true
+    return 0
+  fi
+
+  # First-time: copy the source profile so we get cookies + OpenCLI extension
+  copy_profile
+
+  log "launching headless Chrome on :$PORT  user-data=$HEADLESS_USER_DATA  profile=$HEADLESS_PROFILE_DIR"
+  nohup "$CHROME" \
+    --headless=new \
+    --no-sandbox \
+    --disable-gpu \
+    --disable-dev-shm-usage \
+    --disable-software-rasterizer \
+    --no-first-run \
+    --no-default-browser-check \
+    --disable-session-cracked-bubble \
+    --disable-features=TranslateUI \
+    --noerrdialogs \
+    --user-data-dir="$HEADLESS_USER_DATA" \
+    --profile-directory="$HEADLESS_PROFILE_DIR" \
+    --remote-debugging-port="$PORT" \
+    --remote-allow-origins='*' \
+    --remote-debugging-address=127.0.0.1 \
+    about:blank \
+    >"$LOG" 2>&1 &
+  local pid=$!
+  echo "$pid" > "$PIDFILE"
+  disown "$pid" 2>/dev/null || true
+
+  local waited=0
+  while [ $waited -lt 100 ]; do
+    if probe_cdp; then
+      log "CDP ready on :$PORT after ${waited}00ms  (chrome pid=$pid)"
+      # Now that Chrome has decrypted the cookies, purge anything that isn't
+      # facebook.com. The Cookies SQLite stays small (~5KB instead of ~500KB).
+      purge_non_facebook_cookies
+      cmd_status
+      return 0
+    fi
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  log "Chrome started but CDP never came up on :$PORT"
+  log "Last 20 log lines:"
+  tail -20 "$LOG" >&2 || true
+  return 1
+}
+
+# After Chrome has the headless profile loaded and decrypted the cookies, walk
+# the Cookies SQLite and delete any row whose host_key isn't facebook-related.
+# Keeps: *.facebook.com, facebook.com, .messenger.com, .fb.com, .fbcdn.net,
+# .fbsbx.com, .fb.gg, .facebook.net, and any subdomains of these.
+purge_non_facebook_cookies() {
+  local cookies_db="$HEADLESS_PROFILE/Cookies"
+  [ -f "$cookies_db" ] || return 0
+  # Make a temp copy because Chrome holds the live file open
+  local tmp="${cookies_db}.trim"
+  cp "$cookies_db" "$tmp"
+  # Build the allow list — host_keys we want to keep
+  local keep_pattern='%.facebook.com|%.messenger.com|%.fb.com|%.fbcdn.net|%.fbsbx.com|%.fb.gg|%.facebook.net|facebook.com|messenger.com|fb.com|fbcdn.net|fbsbx.com|fb.gg|facebook.net|%.fbcdn.com'
+  local deleted
+  deleted=$(sqlite3 "$tmp" "DELETE FROM cookies WHERE host_key NOT REGEXP '$keep_pattern'; SELECT changes();" 2>/dev/null || echo 0)
+  if [ -n "$deleted" ] && [ "$deleted" -gt 0 ]; then
+    # Compact the SQLite so we don't waste space
+    sqlite3 "$tmp" "VACUUM;" 2>/dev/null || true
+    cp "$tmp" "$cookies_db"
+    local new_size
+    new_size=$(du -sk "$cookies_db" | awk '{print $1}')
+    log "  ✓ purged $deleted non-fb cookies (${new_size}KB remaining)"
+  fi
+  rm -f "$tmp"
+}
+
+cmd_stop() {
+  local pids
+  pids=$(chrome_pids_for_port)
+  if [ -z "$pids" ]; then
+    log "no headless Chrome on :$PORT"
+    rm -f "$PIDFILE"
+    return 0
+  fi
+  log "stopping pids: $pids"
+  echo "$pids" | xargs -r kill 2>/dev/null || true
+  sleep 0.5
+  echo "$pids" | xargs -r kill -9 2>/dev/null || true
+  rm -f "$PIDFILE"
+  log "stopped"
+}
+
+cmd_restart() {
+  cmd_stop || true
+  sleep 0.3
+  cmd_start
+}
+
+cmd_status() {
+  local pids
+  pids=$(chrome_pids_for_port)
+  if [ -z "$pids" ]; then
+    echo "fb-headless: not running on :$PORT"
+    return 1
+  fi
+  local rss_mb=0
+  for p in $pids; do
+    local rss
+    rss=$(ps -o rss= -p "$p" 2>/dev/null | tr -d ' ' || echo 0)
+    rss_mb=$((rss_mb + rss))
+  done
+  rss_mb=$((rss_mb / 1024))
+  if probe_cdp; then
+    local ver
+    ver=$(curl -s --max-time 2 "http://127.0.0.1:$PORT/json/version" 2>/dev/null | grep -o '"Browser":[^,]*' | head -1 | sed 's/.*: *"\(.*\)"/\1/')
+    echo "fb-headless: running  port=$PORT  pids='$pids'  rss=${rss_mb}MB  browser=$ver"
+    return 0
+  else
+    echo "fb-headless: chrome process exists but CDP not reachable on :$PORT"
+    return 1
+  fi
+}
+
+cmd_logs() {
+  local n="${1:-40}"
+  tail -n "$n" "$LOG"
+}
+
+cmd_reset() {
+  log "removing headless user-data-dir at $HEADLESS_USER_DATA"
+  cmd_stop || true
+  rm -rf "$HEADLESS_USER_DATA"
+  rm -f "$PIDFILE"
+  log "done — next start will re-copy from $SOURCE_PROFILE"
+}
+
+case "${1:-status}" in
+  start)   cmd_start ;;
+  stop)    cmd_stop ;;
+  restart) cmd_restart ;;
+  status)  cmd_status ;;
+  logs)    shift; cmd_logs "${1:-40}" ;;
+  reset)   cmd_reset ;;
+  -h|--help|help|"")
+    sed -n '2,30p' "$0" | sed 's/^# \?//'
+    ;;
+  *) die "unknown subcommand: $1 (try: start|stop|restart|status|logs|reset)" 2 ;;
+esac
