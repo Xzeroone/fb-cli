@@ -276,6 +276,11 @@ function opencli(args, opts = {}) {
     emitEvent('opencli.skip', { reason: bridge.reason });
   }
   env.OPENCLI_WINDOW = mode;
+  // opencli browser commands default to 60s; thread history needs longer
+  if (!env.OPENCLI_BROWSER_COMMAND_TIMEOUT) {
+    const ms = Number(timeout) || 180000;
+    env.OPENCLI_BROWSER_COMMAND_TIMEOUT = String(Math.max(60, Math.ceil(ms / 1000)));
+  }
 
   emitEvent('opencli.start', { sub: `${cmdArgs[0]}:${cmdArgs[1] || ''}`, mode, timeout, cdp: env.OPENCLI_CDP_ENDPOINT || 'none' });
   const r = spawnSync(OPENCLI, cmdArgs, { encoding: 'utf8', maxBuffer: 30 * 1024 * 1024, timeout, env });

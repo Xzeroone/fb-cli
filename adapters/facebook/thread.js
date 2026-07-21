@@ -248,61 +248,119 @@ cli({
     }
     await page.wait(2);
 
-    // Aggressive history load: scroll the real message scroller toward the top
-    // until message count stabilizes or we hit the requested limit.
-    const scrollRounds = Math.min(60, Math.max(12, Math.ceil(limit / 5)));
-    for (let i = 0; i < scrollRounds; i += 1) {
-      const stats = await page.evaluate(`(() => {
-        function findScroller() {
+    // History load: Messenger virtualizes the list. We must (1) wait for top
+    // "Loading..." to finish after IndexedDB/E2EE hydrate, (2) scroll the full
+    // height while harvesting unique aria-labels (DOM only keeps a window).
+    await page.evaluate(`(() => {
+      function findScroller() {
+        let best = null;
+        const root = document.querySelector('[role="main"]') || document.body;
+        for (const el of root.querySelectorAll('div')) {
+          try {
+            const st = getComputedStyle(el);
+            if (el.scrollHeight > el.clientHeight + 50 &&
+                (st.overflowY === 'auto' || st.overflowY === 'scroll' || st.overflowY === 'overlay')) {
+              if (!best || el.scrollHeight > best.scrollHeight) best = el;
+            }
+          } catch (_) {}
+        }
+        return best;
+      }
+      window.__fbThreadScroller = findScroller();
+      window.__fbThreadSeen = window.__fbThreadSeen || new Set();
+      window.__fbThreadOrdered = window.__fbThreadOrdered || [];
+      window.__fbThreadHarvest = () => {
+        const seen = window.__fbThreadSeen;
+        const ordered = window.__fbThreadOrdered;
+        const main = document.querySelector('[role="main"]') || document.body;
+        for (const el of main.querySelectorAll('[aria-label]')) {
+          const a = el.getAttribute('aria-label') || '';
+          if (!/Message sent|Message envoy/i.test(a)) continue;
+          if (seen.has(a)) continue;
+          seen.add(a);
+          ordered.push(a);
+        }
+        return ordered.length;
+      };
+      return true;
+    })()`);
+
+    // Wait at top for Loading to clear (E2EE / LS history hydrate).
+    // Important: do NOT exit on the first non-loading frame — wait until we've
+    // seen Loading at least once OR spent enough time for IDB hydrate.
+    let sawLoading = false;
+    let maxSh = 0;
+    let stable = 0;
+    for (let i = 0; i < 20; i += 1) {
+      const st = await page.evaluate(`(() => {
+        const sc = window.__fbThreadScroller;
+        if (sc) {
+          sc.scrollTop = 0;
+          sc.dispatchEvent(new WheelEvent('wheel', { deltaY: -900, bubbles: true, cancelable: true }));
+        }
+        const main = document.querySelector('[role="main"]');
+        const loading = /Loading/i.test((main && main.innerText) || '');
+        const n = window.__fbThreadHarvest();
+        return { loading, n, sh: sc ? sc.scrollHeight : 0 };
+      })()`);
+      await page.wait(i < 4 ? 1.0 : 0.7);
+      if (st?.loading) sawLoading = true;
+      if ((st?.sh || 0) > maxSh + 20) { maxSh = st.sh; stable = 0; }
+      else stable += 1;
+      // After loading finishes and height stops growing, continue
+      if (sawLoading && st && !st.loading && stable >= 3) break;
+      // Or enough time with no loading and some messages harvested
+      if (!sawLoading && i >= 12 && st && !st.loading && (st.n || 0) >= 5 && stable >= 4) break;
+    }
+
+    // Scroll top → bottom harvesting (virtualized list)
+    let stagnant = 0;
+    let prevCount = 0;
+    for (let i = 0; i < 50; i += 1) {
+      const st = await page.evaluate(`(() => {
+        const sc = window.__fbThreadScroller || (() => {
           let best = null;
           const root = document.querySelector('[role="main"]') || document.body;
-          for (const el of root.querySelectorAll('*')) {
+          for (const el of root.querySelectorAll('div')) {
             try {
-              const st = getComputedStyle(el);
-              if ((st.overflowY === 'auto' || st.overflowY === 'scroll') && el.scrollHeight > el.clientHeight + 80) {
+              const cs = getComputedStyle(el);
+              if (el.scrollHeight > el.clientHeight + 50 &&
+                  (cs.overflowY === 'auto' || cs.overflowY === 'scroll')) {
                 if (!best || el.scrollHeight > best.scrollHeight) best = el;
               }
             } catch (_) {}
           }
+          window.__fbThreadScroller = best;
           return best;
-        }
-        const sc = findScroller();
-        let count = 0;
-        for (const el of document.querySelectorAll('[aria-label]')) {
-          const a = el.getAttribute('aria-label') || '';
-          if (/Message sent|Message envoy/i.test(a)) count += 1;
-        }
-        if (!sc) return { count, scrolled: false, atTop: true, sh: 0, st: 0 };
-        const before = sc.scrollTop;
-        sc.scrollTop = Math.max(0, sc.scrollTop - Math.max(sc.clientHeight * 3, 1400));
-        sc.dispatchEvent(new WheelEvent('wheel', { deltaY: -1600, bubbles: true, cancelable: true }));
-        return {
-          count,
-          scrolled: sc.scrollTop !== before || sc.scrollTop === 0,
-          atTop: sc.scrollTop < 8,
-          sh: sc.scrollHeight,
-          st: Math.round(sc.scrollTop),
-        };
+        })();
+        const n = window.__fbThreadHarvest();
+        if (!sc) return { n, done: true, st: 0, max: 0 };
+        const max = Math.max(0, sc.scrollHeight - sc.clientHeight);
+        sc.scrollTop = Math.min(max, sc.scrollTop + Math.max(120, Math.floor(sc.clientHeight * 0.75)));
+        return { n, done: sc.scrollTop >= max - 4, st: Math.round(sc.scrollTop), max: Math.round(max) };
       })()`);
-
-      await page.wait(i < 5 ? 0.9 : 0.55);
-
-      // Stop early if stuck at top with no growth for a few rounds
-      if (stats?.atTop && i > 6) {
-        const again = await page.evaluate(`(() => {
-          let count = 0;
-          for (const el of document.querySelectorAll('[aria-label]')) {
-            const a = el.getAttribute('aria-label') || '';
-            if (/Message sent|Message envoy/i.test(a)) count += 1;
-          }
-          return count;
-        })()`);
-        if (typeof again === 'number' && again >= limit) break;
-        // one more poke at top then allow a few stagnant rounds
-        if (i > 14 && stats?.count >= (again || 0)) break;
-      }
+      await page.wait(0.35);
+      const n = st?.n || 0;
+      if (n <= prevCount) stagnant += 1; else stagnant = 0;
+      prevCount = n;
+      if (st?.done && stagnant >= 3) break;
+      if (n >= limit * 3 && stagnant >= 5) break; // enough harvested
     }
 
+    // One reverse pass upward
+    for (let i = 0; i < 20; i += 1) {
+      const st = await page.evaluate(`(() => {
+        const sc = window.__fbThreadScroller;
+        window.__fbThreadHarvest();
+        if (!sc) return { top: true };
+        sc.scrollTop = Math.max(0, sc.scrollTop - Math.max(120, Math.floor(sc.clientHeight * 0.75)));
+        return { top: sc.scrollTop <= 2, n: window.__fbThreadSeen.size };
+      })()`);
+      await page.wait(0.3);
+      if (st?.top) break;
+    }
+
+    // Expand See more
     // Expand any visible "See more" in the message pane
     await page.evaluate(`(() => {
       const main = document.querySelector('[role="main"]') || document.body;
@@ -651,7 +709,45 @@ cli({
       throw new AuthRequiredError('www.facebook.com', 'Log in to Facebook in Chrome first.');
     }
 
+    // Merge aria-labels harvested across the full scroll (virtualized DOM misses these)
+    const harvested = await page.evaluate(`(() => {
+      return window.__fbThreadOrdered ? [...window.__fbThreadOrdered] : (window.__fbThreadSeen ? [...window.__fbThreadSeen] : []);
+    })()`).catch(() => []);
+    if (Array.isArray(harvested) && harvested.length) {
+      const extra = [];
+      for (const aria of harvested) {
+        const parsed = parseMessageAria(aria);
+        if (!parsed) continue;
+        let text = parsed.text || '';
+        if (!text) {
+          // Keep a usable fallback so empty Meta AI / media bubbles aren't dropped
+          const m = String(aria).match(/by\s+[^:]+:\s*(.+)$/i);
+          text = (m && m[1].trim()) || (parsed.needsBody ? `[message from ${parsed.sender}]` : '');
+        }
+        extra.push({
+          from_me: parsed.from_me,
+          sender: parsed.sender,
+          text,
+          time: parsed.time || '',
+          kind: 'text',
+          links: [],
+          media_urls: [],
+          attachment_urls: [],
+        });
+      }
+      // Prefer longer text when merging duplicates
+      const byKey = new Map();
+      for (const m of [...extra, ...(Array.isArray(result?.messages) ? result.messages : [])]) {
+        const text = String(m.text || '').trim();
+        const key = `${m.from_me ? 1 : 0}|${m.sender || ''}|${m.time || ''}|${text.slice(0, 40).toLowerCase()}`;
+        const prev = byKey.get(key);
+        if (!prev || String(prev.text || '').length < text.length) byKey.set(key, m);
+      }
+      result.messages = [...byKey.values()];
+    }
+
     let messages = postFilterMessages(Array.isArray(result?.messages) ? result.messages : []);
+
 
     const inv = result?.inventory || {};
     const hasMediaInMessages = messages.some((m) => m.media_urls || m.attachment_urls);
@@ -676,6 +772,30 @@ cli({
         (other, j) => j !== idx && other.text.toLowerCase().startsWith(stem) && other.text.length > m.text.length,
       );
     });
+
+    // Best-effort chronological order (FB times are mixed absolute/relative)
+    function timeKey(t) {
+      const s = String(t || '').trim();
+      if (!s) return 0;
+      const d = Date.parse(s.replace(/\u202f/g, ' '));
+      if (!Number.isNaN(d)) return d;
+      // relative leftovers → treat as recent
+      if (/^(today|yesterday|saturday|sunday|monday|tuesday|wednesday|thursday|friday)/i.test(s)) return Date.now() - 86400000;
+      return 0;
+    }
+    messages.sort((a, b) => timeKey(a.time) - timeKey(b.time));
+    // de-dupe near-identical text+sender
+    {
+      const out = [];
+      const seen = new Set();
+      for (const m of messages) {
+        const k = `${m.sender}|${String(m.text||'').slice(0,80).toLowerCase()}`;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        out.push(m);
+      }
+      messages = out;
+    }
 
     if (messages.length > limit) messages = messages.slice(-limit);
     if (messages.length === 0) {

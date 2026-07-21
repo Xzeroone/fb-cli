@@ -91,7 +91,7 @@ profile_is_heavy() {
   local disk_kb
   disk_kb=$(du -sk "$HEADLESS_USER_DATA" 2>/dev/null | awk '{print $1}')
   # Allow some runtime cache; rebuild if component updates bloat past 80MB
-  [ "${disk_kb:-0}" -gt 80000 ] && return 0
+  [ "${disk_kb:-0}" -gt 250000 ] && return 0  # >250MB = heavy
   return 1
 }
 
@@ -156,10 +156,44 @@ copy_profile() {
     cp "$SOURCE_PROFILE/../First Run" "$HEADLESS_USER_DATA/First Run"
   fi
 
+  # 7. Facebook IndexedDB — Messenger history / E2EE device state (LS / maw_ear).
+  #    Without this, scroll-up history often hangs on "Loading..." forever and only
+  #    the initial ~page of messages is available.
+  copy_facebook_indexeddb
+
   # Trim non-FB cookies *before* Chrome starts (never overwrite a live Cookies DB).
   purge_non_facebook_cookies
 
   log "minimal profile copied"
+}
+
+# Copy only facebook.com IndexedDB from the real profile (not every site).
+copy_facebook_indexeddb() {
+  local src_idb="$SOURCE_PROFILE/IndexedDB"
+  local dst_idb="$HEADLESS_PROFILE/IndexedDB"
+  local name="https_www.facebook.com_0.indexeddb"
+  if [ ! -d "$src_idb/${name}.leveldb" ] && [ ! -d "$src_idb/${name}.blob" ]; then
+    log "  ! no Facebook IndexedDB in source (Messenger history may be incomplete)"
+    return 0
+  fi
+  mkdir -p "$dst_idb"
+  # Source Chrome may hold locks; copy what we can.
+  if [ -d "$src_idb/${name}.leveldb" ]; then
+    rm -rf "$dst_idb/${name}.leveldb"
+    if cp -a "$src_idb/${name}.leveldb" "$dst_idb/${name}.leveldb" 2>/dev/null; then
+      log "  + IndexedDB facebook leveldb ($(du -sk "$dst_idb/${name}.leveldb" | awk '{print $1}')KB)"
+    else
+      # Fallback: copy files ignoring LOCK
+      mkdir -p "$dst_idb/${name}.leveldb"
+      find "$src_idb/${name}.leveldb" -type f ! -name 'LOCK' -exec cp -a {} "$dst_idb/${name}.leveldb/" \; 2>/dev/null || true
+      log "  + IndexedDB facebook leveldb (best-effort copy)"
+    fi
+  fi
+  if [ -d "$src_idb/${name}.blob" ]; then
+    rm -rf "$dst_idb/${name}.blob"
+    cp -a "$src_idb/${name}.blob" "$dst_idb/${name}.blob" 2>/dev/null || true
+    log "  + IndexedDB facebook blob ($(du -sk "$dst_idb/${name}.blob" 2>/dev/null | awk '{print $1}')KB)"
+  fi
 }
 
 purge_non_facebook_cookies() {
