@@ -2,17 +2,10 @@
 /**
  * fb 0.7.0 — Facebook/Messenger CLI, wacli/bird-shaped, lightweight.
  *
- * v0.7.0 changes:
- *   - Default transport is the opencli-managed Chrome on :9222 (or whichever
- *     CDP port is reachable). No fb-managed Chrome, no wmctrl/xdotool/hide
- *     dance, no systemd timer. The user can close the Chrome window;
- *     opencli keeps the browser process alive in the background.
- *   - Optional: `fb-headless start` launches a dedicated headless Chrome on
- *     a separate profile (port 9223) for users who want zero visible UI.
- *     Set FB_CHROME_ENDPOINT=http://127.0.0.1:9223 to opt in.
- *   - All other v0.6.0 surface preserved: FTS5 store, accounts, completion,
- *     --json/--events/--read-only/--account/--store/--timeout/--no-color,
- *     per-subcommand help, lock file, deterministic exit codes.
+ * Transport (forced):
+ *   - ONLY headless Chrome CDP on :9223 via `fb-headless` (dedicated profile).
+ *   - No fallback to visible Chrome :9222. Ever.
+ *   - Auto-starts `fb-headless start` when :9223 is down (unless FB_NO_AUTOSTART=1).
  *
  * Scope is unchanged: this is a shell over opencli + a local SQLite store.
  */
@@ -118,13 +111,9 @@ function parseArgs(argv) {
 // ─── opencli daemon + Chrome CDP discovery ─────────────────────────────────
 // opencli has two services:
 //   1. Daemon (port 19825) — Node bridge that the CLI calls
-//   2. Chrome (port 9222 by default, 9223 for headless) — actual browser
-// The Browser Bridge extension lives inside Chrome and connects to the daemon.
-// For the headless path, we manage a separate Chrome on :9223 with its own
-// profile (fb-headless), so it can run alongside the user's normal Chrome
-// without SingletonLock conflicts.
+//   2. Headless Chrome on :9223 ONLY (fb-headless dedicated profile)
+// Visible Chrome :9222 is intentionally NOT used (no fallback).
 const HEADLESS_CDP = 'http://127.0.0.1:9223';
-const VISIBLE_CDP = 'http://127.0.0.1:9222';
 const DAEMON_URL_DEFAULT = 'http://127.0.0.1:19825';
 
 function cdpProbe(url) {
@@ -133,22 +122,30 @@ function cdpProbe(url) {
     return r.stdout === '200';
   } catch { return false; }
 }
+function isForcedHeadlessUrl(url) {
+  try {
+    const u = new URL(String(url || ''));
+    return u.hostname === '127.0.0.1' || u.hostname === 'localhost'
+      ? u.port === '9223'
+      : String(url).includes(':9223');
+  } catch {
+    return String(url || '').includes(':9223');
+  }
+}
 function chromeCheck() {
-  // User can override with FB_CHROME_ENDPOINT
+  // Forced: only :9223. Non-9223 FB_CHROME_ENDPOINT is ignored (never fall back to :9222).
+  let target = HEADLESS_CDP;
   if (process.env.FB_CHROME_ENDPOINT) {
     const url = process.env.FB_CHROME_ENDPOINT;
-    if (cdpProbe(url)) return { ok: true, url, headless: url.includes(':9223') };
-    return { ok: false, reason: `FB_CHROME_ENDPOINT=${url} not reachable` };
+    if (isForcedHeadlessUrl(url)) target = url;
+    // else: silently ignore :9222 / other endpoints
   }
-  // Prefer the headless Chrome on :9223 (it's the default path now)
-  if (cdpProbe(HEADLESS_CDP)) return { ok: true, url: HEADLESS_CDP, headless: true };
-  // Fall back to the user's visible Chrome on :9222
-  if (cdpProbe(VISIBLE_CDP)) return { ok: true, url: VISIBLE_CDP, headless: false };
-  return { ok: false, reason: 'no Chrome CDP reachable on :9222 or :9223 (run: fb-headless start)' };
+  if (cdpProbe(target)) return { ok: true, url: target, headless: true };
+  return { ok: false, reason: `headless Chrome CDP not reachable on :9223 (run: fb-headless start)` };
 }
 function chromeStr() {
   const r = chromeCheck();
-  if (r.ok) return `${r.url} (${r.headless ? 'headless' : 'visible'})`;
+  if (r.ok) return `${r.url} (headless)`;
   return `NOT FOUND — ${r.reason}`;
 }
 
@@ -206,7 +203,7 @@ function bridgeCheck({ autoStart = true } = {}) {
   if (!dep) return { ok: false, reason: 'opencli daemon not reachable on 19825 (tried to start)', url: null };
   // 2. Ensure Chrome
   const cc = ensureChrome({ autoStart });
-  if (!cc) return { ok: false, reason: 'no Chrome reachable (headless or visible) — tried fb-headless start', url: dep };
+  if (!cc) return { ok: false, reason: 'headless Chrome :9223 not reachable — tried fb-headless start', url: dep };
   // 3. Check extension connection
   const h = daemonHealth();
   if (!h) return { ok: false, reason: 'opencli daemon responded but status unparseable', url: dep, chrome: cc };
@@ -267,12 +264,15 @@ function opencli(args, opts = {}) {
     cmdArgs.push('--keep-tab', 'false');
   }
   // Make sure the full bridge is ready (auto-starts daemon + headless Chrome if needed).
-  // Then point opencli at the Chrome CDP endpoint (NOT the daemon URL — those are different).
+  // ALWAYS pin opencli to headless :9223 — never inherit a :9222 OPENCLI_CDP_ENDPOINT.
   const bridge = bridgeCheck({ autoStart: true });
   const env = { ...process.env };
-  if (bridge.ok && bridge.chrome) {
-    env.OPENCLI_CDP_ENDPOINT = bridge.chrome.url;
-  } else if (!bridge.ok) {
+  env.OPENCLI_CDP_ENDPOINT = (bridge.ok && bridge.chrome && bridge.chrome.url) ? bridge.chrome.url : HEADLESS_CDP;
+  // Strip any accidental override to non-9223
+  if (!isForcedHeadlessUrl(env.OPENCLI_CDP_ENDPOINT)) {
+    env.OPENCLI_CDP_ENDPOINT = HEADLESS_CDP;
+  }
+  if (!bridge.ok) {
     emitEvent('opencli.skip', { reason: bridge.reason });
   }
   env.OPENCLI_WINDOW = mode;
@@ -1081,10 +1081,10 @@ Usage:
   ${PROGRAM} <command> [args] [options]
 
 Architecture (v0.7.0):
-  • Uses whatever opencli Chrome is on :9222 (or :9223 with FB_CHROME_ENDPOINT).
-  • No fb-managed Chrome, no wmctrl/xdotool, no hide dance, no systemd timer.
-  • For zero visible UI:  fb-headless start  (uses a dedicated profile on :9223)
-  • For one-time visible login:  fb auth
+  • FORCED headless Chrome CDP on :9223 only (fb-headless dedicated profile).
+  • No fallback to visible Chrome :9222.
+  • Auto-start: fb-headless start when :9223 is down.
+  • One-time login still uses visible Chrome once (fb auth), then headless copy.
 
 Global flags (anywhere, before or after the subcommand):
   --json, -j        JSON output (every command)
@@ -1161,23 +1161,24 @@ Misc:
 
 Environment:
   OPENCLI_BIN         Path to opencli
-  FB_CHROME_ENDPOINT  CDP endpoint override (default: auto-discover)
+  FB_CHROME_ENDPOINT  Must be http://127.0.0.1:9223 if set (any other port is refused)
   FB_STORE_DIR        Store directory (default: ~/.local/state/fb)
   FB_CONFIG           Config file (default: ~/.config/fb/config.json5)
   FB_ACCOUNT          Default account name
   FB_READONLY         1 to force read-only
+  FB_NO_AUTOSTART     1 to skip auto fb-headless / daemon start
   OPENCLI_WINDOW      background (default) | foreground
-  OPENCLI_CDP_ENDPOINT  opencli-native (used if FB_CHROME_ENDPOINT is unset)
+  OPENCLI_CDP_ENDPOINT  Forced to :9223 by fb (overrides ambient :9222)
   NO_COLOR            Disable ANSI colors
 
 Config (JSON5, comments ok):
   ${CONFIG_PATH}    — { "account": "work", "store": "/srv/fb", "readOnly": true }
 
 Notes:
-  • v0.7.0 dropped: wmctrl/xdotool, fb-hide.timer, fb-chrome-lean as defaults.
-  • Always-on: fb-service install  (fb-opencli + fb-headless on :9223).
+  • CDP is headless-only on :9223. Visible :9222 is never used.
+  • Always-on: fb-service install  (fb-opencli + fb-headless).
   • All exit codes are deterministic: 0=ok, 2=usage, 3=not-authed, 4=not-found, 5=read-only, 6=locked, 7=opencli-fail.
-  • For zero-UI mode:  fb-headless start  (auto-preferred when :9223 is up)
+  • Start backend:  fb-headless start   (or fb-service install)
 `,
 };
 
