@@ -1057,9 +1057,9 @@ function helpFor(sub) {
   if (sub === 'groups') return `fb groups — list groups (live)`;
   if (sub === 'friends') return `fb friends — list friends (live)`;
   if (sub === 'search') return `fb search <query> — top results (mixed, live)`;
-  if (sub === 'posts' || sub === 'search-posts') return `fb posts <query> [--limit N] — public post search (live)`;
+  if (sub === 'posts' || sub === 'search-posts') return `fb posts <query> [--limit N] — public post search (live, max 50)\n\n  Fast list of links + snippets. Then deep-read picks with:\n    fb post "<url>" --json\n\n  Efficient workflow:\n    fb posts "garlic supplier China" -n 50 --json\n    # pick indices/urls, then:\n    fb post "https://www.facebook.com/..." --json`;
   if (sub === 'post' || sub === 'read-post') return `fb post <url|fbid> — deep-read one public post/photo/reel (live)`;
-  if (sub === 'research') return `fb research <query> [--limit N] — posts search + deep-read top N`;
+  if (sub === 'research') return `fb research <query> [--limit N] [--links-only|--deep-all]\n\n  --links-only   search only (default limit 50) — pick then fb post <url>\n  --deep-all     search + deep-read each hit (slow; default limit 5)\n\n  Easiest efficient path:\n    fb research "topic" -n 50 --links-only --json\n    fb post "<chosen-url>" --json`;
   if (sub === 'chats' || sub === 'inbox') return `fb chats | inbox — list Messenger chats (live)`;
   if (sub === 'thread' || sub === 'read') return `fb thread <thread_id|url> [--limit N] — read one Messenger thread`;
   if (sub === 'media' || sub === 'pull') return `fb media | pull <thread|post-url> [--out DIR] [--limit N] [--keep]`;
@@ -1239,13 +1239,31 @@ function main() {
       if (!args[0]) die('Usage: fb post <url|fbid>', EXIT.USAGE, { json: g.json });
       runFacebook('post', [args[0]], g); break;
     case 'research': {
-      if (!args[0]) die('Usage: fb research <query> [--limit N]', EXIT.USAGE, { json: g.json });
-      const q = args.join(' ');
-      const lim = Number(g.limit || 5);
-      const search = opencli(['facebook', 'search-posts', q, '--limit', String(lim), '-f', 'json'], { json: true, timeout: 180000, windowMode: effectiveWindow(g) });
+      // Two modes:
+      //   default / --deep-all  — search + deep-read top N (slow; N pages)
+      //   --links-only          — search only (fast; pick then `fb post <url>`)
+      const researchArgs = args.filter((a) => a !== '--links-only' && a !== '--deep-all' && a !== '--deep');
+      const linksOnly = args.includes('--links-only') || process.env.FB_RESEARCH_LINKS_ONLY === '1';
+      if (!researchArgs[0]) die('Usage: fb research <query> [--limit N] [--links-only|--deep-all]', EXIT.USAGE, { json: g.json });
+      const q = researchArgs.join(' ');
+      const lim = Number(g.limit || (linksOnly ? 50 : 5));
+      const search = opencli(['facebook', 'search-posts', q, '--limit', String(lim), '-f', 'json'], { json: true, timeout: 240000, windowMode: effectiveWindow(g) });
       if (search.status !== 0) { printRaw(search, { json: g.json }); break; }
       const hits = asRows(tryParseJson(search.stdout));
-      const report = stamp({ query: q, count: hits.length, posts: [] }, 'research');
+      if (linksOnly) {
+        const report = stamp({ query: q, count: hits.length, mode: 'links-only', posts: hits }, 'research');
+        if (g.json) console.log(JSON.stringify(report, null, 2));
+        else {
+          console.log(`fb research (links-only): ${q}  hits=${hits.length}\n`);
+          hits.forEach((h, i) => {
+            console.log(`${String(i + 1).padStart(2)}. ${(h.author || '').slice(0, 28).padEnd(28)}  ${(h.url || '(no url)').slice(0, 90)}`);
+            if (h.summary) console.log(`    ${String(h.summary).slice(0, 120)}`);
+          });
+          console.log('\nDeep-read one:  fb post "<url>" --json');
+        }
+        break;
+      }
+      const report = stamp({ query: q, count: hits.length, mode: 'deep-all', posts: [] }, 'research');
       for (const hit of hits.slice(0, lim)) {
         const url = hit.url || hit.Url;
         const entry = { search: hit, detail: null, error: null };

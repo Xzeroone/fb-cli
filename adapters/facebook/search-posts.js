@@ -15,8 +15,8 @@ import {
   stripNoise,
 } from './_post_utils.js';
 
-const LIMIT_DEFAULT = 12;
-const LIMIT_MAX = 40;
+const LIMIT_DEFAULT = 20;
+const LIMIT_MAX = 50;
 
 function normalizeLimit(raw) {
   if (raw === undefined || raw === null || raw === '') return LIMIT_DEFAULT;
@@ -126,7 +126,7 @@ cli({
   navigateBefore: false,
   args: [
     { name: 'query', type: 'str', positional: true, required: true, help: 'Search query' },
-    { name: 'limit', type: 'int', default: LIMIT_DEFAULT, help: 'Max posts (1-40)' },
+    { name: 'limit', type: 'int', default: LIMIT_DEFAULT, help: 'Max posts (1-50)' },
   ],
   columns: ['index', 'author', 'summary', 'url', 'kind'],
   func: async (page, args) => {
@@ -153,10 +153,29 @@ cli({
       }
       await page.wait(2.5);
 
-      // progressive scroll to hydrate results
-      for (let i = 0; i < 6; i += 1) {
-        await page.evaluate(`(() => { window.scrollBy(0, Math.floor(window.innerHeight * 0.85)); })()`);
-        await page.wait(1.0);
+      // Progressive scroll to hydrate results. Scale with requested limit so
+      // --limit 50 actually loads more than a single viewport.
+      const scrollRounds = Math.min(22, Math.max(6, Math.ceil(limit / 3) + 4));
+      let lastCount = 0;
+      let stagnant = 0;
+      for (let i = 0; i < scrollRounds; i += 1) {
+        await page.evaluate(`(() => { window.scrollBy(0, Math.floor(window.innerHeight * 0.9)); })()`);
+        await page.wait(i < 3 ? 1.1 : 0.75);
+        // early stop if link density stops growing
+        const cnt = await page.evaluate(`(() => {
+          let n = 0;
+          for (const a of document.querySelectorAll('a[href]')) {
+            const h = a.href || '';
+            if (/\\/posts\\/|permalink\\.php|story\\.php|photo\\/\\?fbid=|\\/reel\\/|\\/videos\\/|fbid=\\d+/i.test(h) && !/\\/search\\//i.test(h)) n += 1;
+          }
+          return n;
+        })()`);
+        if (typeof cnt === 'number') {
+          if (cnt <= lastCount) stagnant += 1; else stagnant = 0;
+          lastCount = cnt;
+          if (cnt >= limit * 2 && stagnant >= 2) break;
+          if (stagnant >= 4 && i > 6) break;
+        }
       }
 
       const extracted = await page.evaluate(`(() => {
@@ -303,8 +322,9 @@ cli({
       }
       const polished = polishSearchRows(extracted?.rows || [], limit);
       if (polished.length > best.length) best = polished;
-      // good enough
-      if (best.length >= Math.min(limit, 5)) break;
+      // Prefer Posts filter; stop once we have enough (or nearly enough) hits
+      if (best.length >= limit) break;
+      if (best.length >= Math.min(limit, 12) && /\/search\/posts/i.test(searchUrl)) break;
     }
 
     if (lastAuth && !best.length) {
